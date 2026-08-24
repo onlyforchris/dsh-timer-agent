@@ -16,7 +16,11 @@ import css from './board.module.css'
 /** The injected board container (kept in the DOM, hidden when inactive). */
 export const BOARD_VIEW_SELECTOR = '[data-dsh-timeragent-view]'
 
-const CONVERSATION_COLUMN_SELECTOR = '[data-pane="conversation"]'
+/** Prefer data-pane (older shells); fall back to hashed centerCol class (0.1.1+). */
+const CONVERSATION_COLUMN_SELECTORS = [
+  '[data-pane="conversation"]',
+  '[class*="centerCol"]',
+] as const
 const ACTIVE_ATTR = 'data-dsh-timeragent-active'
 /** Sibling panels' activation attributes, removed when this panel opens. */
 const OTHER_ACTIVE_ATTRS = ['data-dsh-ssh-active', 'data-dsh-taskboard-active']
@@ -26,7 +30,11 @@ const PANEL_NAME = 'timeragent'
 
 /** Find the center column, or undefined while the frame is not mounted. */
 function conversationColumn(): HTMLElement | undefined {
-  return document.querySelector<HTMLElement>(CONVERSATION_COLUMN_SELECTOR) ?? undefined
+  for (const selector of CONVERSATION_COLUMN_SELECTORS) {
+    const el = document.querySelector<HTMLElement>(selector)
+    if (el !== null) return el
+  }
+  return undefined
 }
 
 /**

@@ -86,6 +86,8 @@ export interface JobModelSelection {
   provider: string
   /** Provider-owned model id. */
   model: string
+  /** Optional reasoning effort (mirrors deployment default when omitted at run time). */
+  reasoningEffort?: string
 }
 
 /** One scheduled job on the board. */

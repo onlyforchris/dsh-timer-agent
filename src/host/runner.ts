@@ -31,22 +31,56 @@ export interface RunnerDeps {
   store: HostJobStore
   /** Clock; injectable for tests. */
   now?: () => number
+  /**
+   * Fallback cwd when a job's target.workdir is blank and no session is pinned.
+   * Empty string keeps upstream behavior (deployment default workspace).
+   */
+  defaultWorkdir?: string
 }
 
-/** Slug a job title into a session-id-safe prefix (hermes names its cron sessions the same way). */
+/**
+ * Slug a job title into a session-id-safe prefix.
+ * ASCII only: DSH puts the session id into `x-deepseek-harness-session-id`,
+ * and fetch rejects non-ByteString header values (Chinese titles → TRANSPORT).
+ */
 function slug(title: string): string {
-  const base = title.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-').replace(/^-+|-+$/g, '')
+  const base = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
   return base === '' ? 'job' : base.slice(0, 32)
 }
 
 /** Safely read a selection off the default-model service (undefined on throw). */
-function trySelection(defaults: { currentSelection(): { provider: string, model: string } }): { provider: string, model: string } | undefined {
+function trySelection(defaults: {
+  currentSelection(): { provider: string, model: string, reasoningEffort?: string }
+}): { provider: string, model: string, reasoningEffort?: string } | undefined {
   try {
     const selection = defaults.currentSelection()
     if (selection.provider === '' || selection.model === '') return undefined
-    return selection
+    return {
+      provider: selection.provider,
+      model: selection.model,
+      ...selection.reasoningEffort === undefined || selection.reasoningEffort === ''
+        ? {}
+        : { reasoningEffort: selection.reasoningEffort },
+    }
   } catch {
     return undefined
+  }
+}
+
+/** Build agentOptions for create/resume, preserving reasoning effort from defaults. */
+function resolveAgentOptions(
+  jobSelection: { provider: string, model: string, reasoningEffort?: string } | undefined,
+  defaults: { currentSelection(): { provider: string, model: string, reasoningEffort?: string } } | undefined,
+): { provider: string, model: string, reasoningEffort?: string } | undefined {
+  const fallback = defaults === undefined ? undefined : trySelection(defaults)
+  const seed = jobSelection ?? fallback
+  if (seed === undefined) return undefined
+  const effort = seed.reasoningEffort
+    ?? (jobSelection !== undefined ? fallback?.reasoningEffort : undefined)
+  return {
+    provider: seed.provider,
+    model: seed.model,
+    ...effort === undefined || effort === '' ? {} : { reasoningEffort: effort },
   }
 }
 
@@ -79,6 +113,7 @@ export class TimerRunner {
   private readonly ctx: HostPluginContext
   private readonly store: HostJobStore
   private readonly now: () => number
+  private readonly defaultWorkdir: string
   private readonly inFlight = new Map<string, InFlight>() // by messageId
   private timer: ReturnType<typeof setInterval> | undefined
   private requestTimer: ReturnType<typeof setInterval> | undefined
@@ -90,6 +125,14 @@ export class TimerRunner {
     this.ctx = deps.ctx
     this.store = deps.store
     this.now = deps.now ?? (() => Date.now())
+    this.defaultWorkdir = (deps.defaultWorkdir ?? '').trim()
+  }
+
+  /** Effective workdir for a new-session run: job override, else plugin default. */
+  private resolveWorkdir(job: JobRecord): string {
+    const fromJob = job.target.workdir.trim()
+    if (fromJob !== '') return fromJob
+    return this.defaultWorkdir
   }
 
   /** Start the ticker + the session-event watcher. */
@@ -256,7 +299,10 @@ export class TimerRunner {
         // without one the resume keeps the session's persisted selection.
         const handle = await agents.resume({
           resumeSessionId: pinnedId,
-          ...job.modelSelection === undefined ? {} : { agentOptions: { ...job.modelSelection } },
+          ...(() => {
+            const options = resolveAgentOptions(job.modelSelection, this.ctx.get('agentDefaultModel'))
+            return options === undefined ? {} : { agentOptions: options }
+          })(),
           ...resumeSetup === undefined ? {} : { setup: resumeSetup },
         })
         this.pinnedHandles.set(pinnedId, handle)
@@ -279,11 +325,7 @@ export class TimerRunner {
     // work starts. Resolution order: the job's own model selection, else the
     // deployment agentDefaultModel (mirroring the GUI/headless entry points).
     const defaults = this.ctx.get('agentDefaultModel')
-    let agentOptions: { provider?: string, model?: string, reasoningEffort?: string } | undefined
-    const seed = job.modelSelection ?? (defaults === undefined ? undefined : trySelection(defaults))
-    if (seed !== undefined) {
-      agentOptions = { provider: seed.provider, model: seed.model }
-    }
+    const agentOptions = resolveAgentOptions(job.modelSelection, defaults)
     // Join the deployment's default agent preset: without it the new session
     // runs on the empty global layer — no tool packages, no preset prompt
     // sections. A broken default preset fails the run loudly (creation rolls
@@ -291,15 +333,16 @@ export class TimerRunner {
     let presetMeta: { agentPreset: string } | undefined
     let presetSetup: ((agentCtx: object) => Promise<void>) | undefined
     ;({ presetMeta, presetSetup } = await this.composeDefaultPreset())
+    const workdir = this.resolveWorkdir(job)
     const handle = await agents.create({
       sessionId,
       ...(agentOptions !== undefined ? { agentOptions } : {}),
-      ...(job.target.workdir !== ''
-        ? { meta: { cwd: job.target.workdir, ...presetMeta } }
+      ...(workdir !== ''
+        ? { meta: { cwd: workdir, ...presetMeta } }
         : presetMeta === undefined ? {} : { meta: presetMeta }),
       ...(presetSetup === undefined ? {} : { setup: presetSetup }),
     })
-    await this.attachWorkspace(sessionId, job.target.workdir).catch(() => undefined)
+    await this.attachWorkspace(sessionId, workdir).catch(() => undefined)
     return handle
   }
 

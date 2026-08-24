@@ -166,8 +166,11 @@ export class RemoteBoardController {
   /** Host-owned now; kept for interface parity. */
   async applyScheduleNextRun(): Promise<void> {}
 
-  /** Jump to an execution's session transcript. */
+  /** Jump to an execution's session transcript (leave the timer board first). */
   openSession(sessionId: string): void {
+    this.selectedJobId = undefined
+    this.boardOpen = false
+    this.notify()
     this.sessions.open(sessionId)
   }
 

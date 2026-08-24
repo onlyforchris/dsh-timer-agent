@@ -119,7 +119,7 @@ export interface ModelOptionGroup {
 /** Host model-options payload: the deployment default plus the catalog. */
 export interface ModelOptions {
   /** Deployment agentDefaultModel selection, when the service answers. */
-  default?: { provider: string, model: string }
+  default?: { provider: string, model: string, reasoningEffort?: string }
   /** Successfully loaded provider groups. */
   groups: ModelOptionGroup[]
 }
@@ -183,11 +183,20 @@ export async function listTargetOptions(ctx: ClientContext): Promise<TargetGroup
     })),
   })
 
-  const groups: TargetGroup[] = [
-    toGroup('default', '默认工作空间', ''),
-  ]
+  // No synthetic "默认工作空间" (workdir='') — it has no real directory and
+  // confuses timed jobs. Prefer registered workspaces; leftover cwd buckets last.
+  const groups: TargetGroup[] = []
+  const seen = new Set<string>()
+  const preferredPath = normPath('D:/DSH/im-workspace')
 
-  const seen = new Set<string>([''])
+  // Put im-workspace first when present.
+  for (const workspace of workspaces) {
+    const key = normPath(workspace.path)
+    if (key === preferredPath) {
+      seen.add(key)
+      groups.push(toGroup(`ws:${workspace.id}`, pathBasename(workspace.path), workspace.path))
+    }
+  }
   for (const workspace of workspaces) {
     const key = normPath(workspace.path)
     if (seen.has(key)) continue

@@ -14,6 +14,7 @@ import type { BoardControllerFace } from '../controller-face.ts'
 import { isValidCron } from '../../core/schedule.ts'
 import { t, type TimerAgentKey } from '../locales.ts'
 import css from '../board.module.css'
+import { SelectField } from './SelectField.tsx'
 
 /** One selectable leaf inside a group. */
 export interface Leaf {
@@ -25,16 +26,15 @@ export interface Leaf {
 
 /** Common scheduled-run presets (cron → locale label), task-board parity. */
 const SCHEDULE_PRESETS: ReadonlyArray<{ cron: string; label: TimerAgentKey }> = [
-  { cron: '0 9 * * *', label: 'detail.schedule.preset.daily9' },
-  { cron: '0 * * * *', label: 'detail.schedule.preset.hourly' },
+  { cron: '*/2 * * * *', label: 'detail.schedule.preset.twoMin' },
   { cron: '*/10 * * * *', label: 'detail.schedule.preset.tenMin' },
+  { cron: '0 * * * *', label: 'detail.schedule.preset.hourly' },
+  { cron: '0 9 * * *', label: 'detail.schedule.preset.daily9' },
   { cron: '0 9 * * 1', label: 'detail.schedule.preset.weeklyMon9' },
 ]
 
 /** The default-workspace placeholder group (used before options load). */
-export const DEFAULT_TARGET_GROUPS: TargetGroup[] = [
-  { key: 'default', name: '默认工作空间', workdir: '', sessions: [] },
-]
+export const DEFAULT_TARGET_GROUPS: TargetGroup[] = []
 
 /** Flatten a group into its selectable leaves: new-session first, sessions after. */
 export function leavesOf(group: TargetGroup): Leaf[] {
@@ -110,6 +110,15 @@ export function TargetTree({ groups, expanded, selectedKey, onToggle, onSelect }
   )
 }
 
+/** Prefer the multimodal Flash-Vision-Exp entry; otherwise the last catalog leaf. */
+export function pickDefaultModelKey(leaves: ReadonlyArray<ModelLeaf>): string {
+  if (leaves.length === 0) return ''
+  const preferred = [...leaves].reverse().find(leaf =>
+    /flash-vision-exp/i.test(leaf.model) || /flash-vision-exp/i.test(leaf.label),
+  )
+  return preferred?.key ?? leaves[leaves.length - 1].key
+}
+
 /** Flatten provider groups into selectable model leaves. */
 function modelLeavesOf(options: ModelOptions): ModelLeaf[] {
   const leaves: ModelLeaf[] = []
@@ -133,7 +142,7 @@ export function NewJobModal({ controller, targetOptions, modelOptions, onClose }
   const [prompt, setPrompt] = useState('')
   const [groups, setGroups] = useState<TargetGroup[]>(DEFAULT_TARGET_GROUPS)
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set<string>())
-  const [selectedKey, setSelectedKey] = useState('default:new')
+  const [selectedKey, setSelectedKey] = useState('')
   const [modelOptionsState, setModelOptionsState] = useState<ModelOptions>({ groups: [] })
   const [modelKey, setModelKey] = useState('')
   const [cronEnabled, setCronEnabled] = useState(false)
@@ -143,13 +152,18 @@ export function NewJobModal({ controller, targetOptions, modelOptions, onClose }
   useEffect(() => {
     let alive = true
     void targetOptions().then(next => {
-      if (alive && next.length > 0) {
-        setGroups(next)
-        // All groups start collapsed; the user expands what they need.
-      }
+      if (!alive || next.length === 0) return
+      setGroups(next)
+      const preferred = next.find(group => /im-workspace$/i.test(group.workdir.replaceAll('\\', '/')))
+        ?? next[0]
+      setSelectedKey(`${preferred.key}:new`)
+      setExpanded(new Set([preferred.key]))
     }).catch(() => undefined)
     void modelOptions().then(next => {
-      if (alive) setModelOptionsState(next)
+      if (!alive) return
+      setModelOptionsState(next)
+      const leaves = modelLeavesOf(next)
+      setModelKey(prev => (prev !== '' ? prev : pickDefaultModelKey(leaves)))
     }).catch(() => undefined)
     return () => { alive = false }
   }, [targetOptions, modelOptions])
@@ -161,16 +175,18 @@ export function NewJobModal({ controller, targetOptions, modelOptions, onClose }
     return map
   }, [groups])
 
-  const selected = leafOf.get(selectedKey) ?? { key: 'default:new', label: '', workdir: '', sessionId: '' }
+  const selected = leafOf.get(selectedKey) ?? (
+    groups[0] !== undefined
+      ? { key: `${groups[0].key}:new`, label: '', workdir: groups[0].workdir, sessionId: '' }
+      : { key: '', label: '', workdir: 'D:\\DSH\\im-workspace', sessionId: '' }
+  )
 
-  /** Flattened model picker options; key '' = follow the default resolution. */
+  /** Catalog models only — no synthetic “follow default” row. */
   const modelLeaves = useMemo(() => modelLeavesOf(modelOptionsState), [modelOptionsState])
-  const modelDefaultLabel = selected.sessionId !== ''
-    ? t('new.model.followSession')
-    : modelOptionsState.default !== undefined
-      ? `${modelOptionsState.default.provider} · ${modelOptionsState.default.model}（${t('new.model.followDefault')}）`
-      : t('new.model.followDefault')
-
+  const modelSelectOptions = useMemo(
+    () => modelLeaves.map(leaf => ({ value: leaf.key, label: leaf.label })),
+    [modelLeaves],
+  )
   const toggleGroup = (key: string): void => {
     setExpanded(prev => {
       const next = new Set(prev)
@@ -184,12 +200,22 @@ export function NewJobModal({ controller, targetOptions, modelOptions, onClose }
     // Stage the cron so createJob arms the schedule server-side in one call.
     controller.stageCreateCron?.(cronEnabled && isValidCron(cron) ? cron : undefined)
     const model = modelLeaves.find(leaf => leaf.key === modelKey)
+      ?? modelLeaves.find(leaf => leaf.key === pickDefaultModelKey(modelLeaves))
+    const defaultEffort = modelOptionsState.default?.reasoningEffort
     const created = controller.createJob({
       title,
       description,
       prompt,
       target: { workdir: selected.workdir, sessionId: selected.sessionId },
-      ...model === undefined ? {} : { modelSelection: { provider: model.provider, model: model.model } },
+      ...model === undefined ? {} : {
+        modelSelection: {
+          provider: model.provider,
+          model: model.model,
+          ...defaultEffort === undefined || defaultEffort === ''
+            ? {}
+            : { reasoningEffort: defaultEffort },
+        },
+      },
     })
     void Promise.resolve(created).then(job => {
       if (job === undefined) {
@@ -257,23 +283,19 @@ export function NewJobModal({ controller, targetOptions, modelOptions, onClose }
 
         <label className={css.field}>
           <span className={css.fieldLabel}>{t('new.model')}</span>
-          <select
-            className={css.input}
+          <SelectField
             value={modelKey}
-            aria-label={t('new.model')}
-            onChange={event => { setModelKey(event.target.value) }}
-          >
-            <option value="">{modelDefaultLabel}</option>
-            {modelLeaves.map(leaf => (
-              <option key={leaf.key} value={leaf.key}>{leaf.label}</option>
-            ))}
-          </select>
+            options={modelSelectOptions}
+            ariaLabel={t('new.model')}
+            onChange={setModelKey}
+          />
         </label>
 
         <div className={css.field}>
           <label className={css.scheduleToggle}>
             <input
               type="checkbox"
+              className={css.checkbox}
               checked={cronEnabled}
               onChange={event => { setCronEnabled(event.target.checked) }}
             />
@@ -289,23 +311,21 @@ export function NewJobModal({ controller, targetOptions, modelOptions, onClose }
                 aria-label={t('new.schedule.cron')}
                 onChange={event => { setCron(event.target.value); setError(undefined) }}
               />
-              <select
-                className={`${css.input} ${css.schedulePreset}`}
-                value=""
-                aria-label={t('detail.schedule.presets')}
-                onChange={event => {
-                  const preset = event.target.value
-                  if (preset !== '') {
-                    setCron(preset)
+              <SelectField
+                className={css.schedulePreset}
+                value={SCHEDULE_PRESETS.some(preset => preset.cron === cron) ? cron : ''}
+                options={[
+                  { value: '', label: `${t('detail.schedule.presets')}…` },
+                  ...SCHEDULE_PRESETS.map(preset => ({ value: preset.cron, label: t(preset.label) })),
+                ]}
+                ariaLabel={t('detail.schedule.presets')}
+                onChange={next => {
+                  if (next !== '') {
+                    setCron(next)
                     setError(undefined)
                   }
                 }}
-              >
-                <option value="">{t('detail.schedule.presets')}…</option>
-                {SCHEDULE_PRESETS.map(preset => (
-                  <option key={preset.cron} value={preset.cron}>{t(preset.label)}</option>
-                ))}
-              </select>
+              />
             </div>
           )}
         </div>

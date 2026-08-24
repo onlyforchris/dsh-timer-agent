@@ -252,6 +252,56 @@ section('TimerRunner: workdir passes cwd to agents.create')
   check('agents.create received meta.cwd=workdir', host.calls.some(c => c.kind === 'create' && c.cwd === 'D:/work/proj'))
 }
 
+section('TimerRunner: defaultWorkdir fills blank job workdir')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'runner-default-wd.json'))
+  let now = Date.UTC(2026, 0, 1)
+  const runner = new TimerRunner({
+    ctx: host.ctx,
+    store: s,
+    now: () => now,
+    defaultWorkdir: 'D:/DSH/im-workspace',
+  })
+  let job = createJob({ title: 'im', description: '', prompt: 'p', target: { workdir: '', sessionId: '' } }, now, 'job-default-wd')
+  job = withSchedule(job, { enabled: true, cron: '0 * * * *', nextRunAt: now - 1 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
+  await runner.tick()
+  await new Promise(r => setTimeout(r, 25))
+  check('blank workdir uses plugin defaultWorkdir', host.calls.some(c => c.kind === 'create' && c.cwd === 'D:/DSH/im-workspace'))
+}
+
+section('TimerRunner: Chinese title → ASCII-only session id (ByteString-safe)')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'runner-zh-slug.json'))
+  let now = Date.UTC(2026, 7, 24, 2, 0, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  let job = createJob({
+    title: '测试',
+    description: '',
+    prompt: '只回复一行：TIMER-SMOKE-OK',
+    target: { workdir: 'D:/DSH/im-workspace', sessionId: '' },
+  }, now, 'job-zh')
+  job = withSchedule(job, { enabled: true, cron: '0 * * * *', nextRunAt: now - 1 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
+  await runner.tick()
+  await new Promise(r => setTimeout(r, 25))
+  const created = host.calls.find(c => c.kind === 'create')
+  const sid = created?.sessionId ?? ''
+  check('create used ASCII session id', /^timer-[a-z0-9-]+-\d{14}$/.test(sid), sid)
+  check('session id has no non-ASCII', [...sid].every(ch => ch.charCodeAt(0) < 128), sid)
+  // Mimic DSH header encoding: undici rejects values > 255
+  let headerOk = true
+  try {
+    // eslint-disable-next-line no-new
+    new Headers({ 'x-deepseek-harness-session-id': sid })
+  } catch {
+    headerOk = false
+  }
+  check('session id is valid HTTP header ByteString', headerOk, sid)
+}
+
 // ============================================================================
 // 4. timer_agent tool
 // ============================================================================

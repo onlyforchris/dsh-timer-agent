@@ -97,7 +97,12 @@ function readModelSelection(value: unknown): JobModelSelection | 'invalid' | und
   const provider = typeof record.provider === 'string' ? record.provider.trim() : ''
   const model = typeof record.model === 'string' ? record.model.trim() : ''
   if (provider === '' || model === '') return 'invalid'
-  return { provider, model }
+  const effort = typeof record.reasoningEffort === 'string' ? record.reasoningEffort.trim() : ''
+  return {
+    provider,
+    model,
+    ...effort === '' ? {} : { reasoningEffort: effort },
+  }
 }
 
 /** Dependencies the routes close over. */

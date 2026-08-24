@@ -18,6 +18,7 @@ import { t, type TimerAgentKey } from '../locales.ts'
 import css from '../board.module.css'
 import { formatTime, STATUS_LABEL_KEY } from './TimerBoard.tsx'
 import { DEFAULT_TARGET_GROUPS, leavesOf, TargetTree } from './NewJobModal.tsx'
+import { SelectField } from './SelectField.tsx'
 
 /** Execution outcome → locale key. */
 const RESULT_KEY: Record<NonNullable<ExecutionRecord['result']>, TimerAgentKey> = {
@@ -44,10 +45,14 @@ function ExecutionRow({ execution, onOpen }: { execution: ExecutionRecord; onOpe
         <button
           type="button"
           className={css.linkButton}
-          onClick={() => { onOpen(execution.sessionId as string) }}
+          onClick={event => {
+            event.preventDefault()
+            event.stopPropagation()
+            onOpen(execution.sessionId as string)
+          }}
           title={execution.sessionId}
         >
-          {t('detail.viewSession')} ⌁
+          {t('detail.viewSession')}
         </button>
       )}
       {execution.error !== undefined && execution.error !== '' && (
@@ -59,9 +64,10 @@ function ExecutionRow({ execution, onOpen }: { execution: ExecutionRecord; onOpe
 
 /** Common scheduled-run presets (cron → locale label). */
 const SCHEDULE_PRESETS: ReadonlyArray<{ cron: string; label: TimerAgentKey }> = [
-  { cron: '0 9 * * *', label: 'detail.schedule.preset.daily9' },
-  { cron: '0 * * * *', label: 'detail.schedule.preset.hourly' },
+  { cron: '*/2 * * * *', label: 'detail.schedule.preset.twoMin' },
   { cron: '*/10 * * * *', label: 'detail.schedule.preset.tenMin' },
+  { cron: '0 * * * *', label: 'detail.schedule.preset.hourly' },
+  { cron: '0 9 * * *', label: 'detail.schedule.preset.daily9' },
   { cron: '0 9 * * 1', label: 'detail.schedule.preset.weeklyMon9' },
 ]
 
@@ -293,6 +299,7 @@ export function JobDetail({ controller, job, targetOptions }: { controller: Boar
                 <label className={css.scheduleToggle}>
                   <input
                     type="checkbox"
+                    className={css.checkbox}
                     checked={scheduleEnabledDraft}
                     onChange={event => { setScheduleEnabledDraft(event.target.checked); setError(undefined) }}
                   />
@@ -307,23 +314,21 @@ export function JobDetail({ controller, job, targetOptions }: { controller: Boar
                     aria-label={t('detail.schedule.cron')}
                     onChange={event => { setCronDraft(event.target.value); setError(undefined) }}
                   />
-                  <select
-                    className={`${css.input} ${css.schedulePreset}`}
-                    value=""
-                    aria-label={t('detail.schedule.presets')}
-                    onChange={event => {
-                      const preset = event.target.value
-                      if (preset !== '') {
-                        setCronDraft(preset)
+                  <SelectField
+                    className={css.schedulePreset}
+                    value={SCHEDULE_PRESETS.some(preset => preset.cron === cronDraft) ? cronDraft : ''}
+                    options={[
+                      { value: '', label: `${t('detail.schedule.presets')}…` },
+                      ...SCHEDULE_PRESETS.map(preset => ({ value: preset.cron, label: t(preset.label) })),
+                    ]}
+                    ariaLabel={t('detail.schedule.presets')}
+                    onChange={next => {
+                      if (next !== '') {
+                        setCronDraft(next)
                         setError(undefined)
                       }
                     }}
-                  >
-                    <option value="">{t('detail.schedule.presets')}…</option>
-                    {SCHEDULE_PRESETS.map(preset => (
-                      <option key={preset.cron} value={preset.cron}>{t(preset.label)}</option>
-                    ))}
-                  </select>
+                  />
                 </div>
                 {scheduleEnabledDraft && (
                   <p className={css.scheduleMeta}>
