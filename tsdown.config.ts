@@ -50,10 +50,10 @@ export default defineConfig([
     },
   },
   {
-    name: 'dsh-timer-agent/client',
+    name: '@onlyforchris/dsh-timer-agent/client',
     entry: { client: 'src/client/index.ts' },
     outDir: 'lib',
-    // The dsh web shell serves /plugins/dsh-timer-agent/client.js as an
+    // The dsh web shell serves the scoped plugin's client.js as an
     // external classic script; the bundle must register a factory, not run
     // its module body at script-execution time. CSS injection therefore also
     // lives inside the factory (scripts/inline-css.mjs inserts it before the
@@ -70,7 +70,7 @@ export default defineConfig([
     },
     outputOptions: {
       entryFileNames: 'client.js',
-      banner: 'window.__ModuleLoader__.load({ id: "dsh-timer-agent", factory: (require) => {',
+      banner: 'window.__ModuleLoader__.load({ id: "@onlyforchris/dsh-timer-agent", factory: (require) => {',
       intro: 'var module = { exports: {} }; var exports = module.exports;',
       footer: 'return module.exports; } });',
     },

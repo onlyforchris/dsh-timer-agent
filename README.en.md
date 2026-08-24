@@ -4,7 +4,7 @@
 
 A personally maintained [DeepSeek Harness (DSH)](https://deepseek-harness.github.io/deepseek-harness/) Web plugin: a host-resident cron engine inside `dsh web` that **runs your prompt in a real agent session** on schedule — including when the GUI is closed. Forked from [LouisHaoL/dsh-timer-agent](https://github.com/LouisHaoL/dsh-timer-agent) and tuned for an IM sandbox workdir (`im-workspace`).
 
-Repo: [onlyforchris/dsh-timer-agent](https://github.com/onlyforchris/dsh-timer-agent) · Release: [v0.1.2](https://github.com/onlyforchris/dsh-timer-agent/releases/tag/v0.1.2)
+Repo: [onlyforchris/dsh-timer-agent](https://github.com/onlyforchris/dsh-timer-agent) · Current version: `@onlyforchris/dsh-timer-agent@0.1.3`
 
 ![New job modal: real workspace target tree + model picker](docs/new-job-modal.png)
 
@@ -63,10 +63,16 @@ Settlement uses `session/event` (`turn/end` `reason.kind`); failure reasons land
 
 **A · Release tarball**
 
-Download `dsh-timer-agent-*.tgz` from [Releases](https://github.com/onlyforchris/dsh-timer-agent/releases):
+Download `onlyforchris-dsh-timer-agent-*.tgz` from [Releases](https://github.com/onlyforchris/dsh-timer-agent/releases):
 
 ```sh
-dsh plugin --profile web add ./dsh-timer-agent-0.1.2.tgz
+dsh plugin --profile web add ./onlyforchris-dsh-timer-agent-0.1.3.tgz
+```
+
+After the package is published to npm, the exact version can also be installed directly:
+
+```sh
+dsh plugin --profile web add --save-exact @onlyforchris/dsh-timer-agent@0.1.3
 ```
 
 **B · Local link**

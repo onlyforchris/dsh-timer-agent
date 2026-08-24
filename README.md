@@ -4,7 +4,7 @@
 
 个人维护的 [DeepSeek Harness (DSH)](https://deepseek-harness.github.io/deepseek-harness/) Web 插件：在 `dsh web` 宿主进程里跑常驻 cron，**到点用真实 agent 会话执行 prompt**。GUI 关掉也会继续触发。基于 [LouisHaoL/dsh-timer-agent](https://github.com/LouisHaoL/dsh-timer-agent) 改造，默认面向 IM 沙盒工作区（`im-workspace`）。
 
-仓库：[onlyforchris/dsh-timer-agent](https://github.com/onlyforchris/dsh-timer-agent) · Release：[v0.1.2](https://github.com/onlyforchris/dsh-timer-agent/releases/tag/v0.1.2)
+仓库：[onlyforchris/dsh-timer-agent](https://github.com/onlyforchris/dsh-timer-agent) · 当前版本：`@onlyforchris/dsh-timer-agent@0.1.3`
 
 ![新建任务：真实工作区目标树 + 模型选择](docs/new-job-modal.png)
 
@@ -63,10 +63,16 @@
 
 **方式 A · Release 包**
 
-从 [Releases](https://github.com/onlyforchris/dsh-timer-agent/releases) 下载 `dsh-timer-agent-*.tgz`：
+从 [Releases](https://github.com/onlyforchris/dsh-timer-agent/releases) 下载 `onlyforchris-dsh-timer-agent-*.tgz`：
 
 ```sh
-dsh plugin --profile web add ./dsh-timer-agent-0.1.2.tgz
+dsh plugin --profile web add ./onlyforchris-dsh-timer-agent-0.1.3.tgz
+```
+
+发布到 npm 后，也可以安装固定版本：
+
+```sh
+dsh plugin --profile web add --save-exact @onlyforchris/dsh-timer-agent@0.1.3
 ```
 
 **方式 B · 本地 link 开发**

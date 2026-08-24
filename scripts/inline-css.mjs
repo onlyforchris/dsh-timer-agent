@@ -43,10 +43,10 @@ const injector = `
 // #region inlined stylesheet (post-build: scripts/inline-css.mjs)
 (function injectTimerAgentStyle() {
   if (typeof document === 'undefined') return;
-  var tagId = 'dsh-timer-agent/board.module.css';
+  var tagId = 'onlyforchris-dsh-timer-agent/board.module.css';
   if (document.querySelector('style[data-plugin-css=' + JSON.stringify(tagId) + ']') !== null) return;
   var style = document.createElement('style');
-  style.setAttribute('data-plugin', 'dsh-timer-agent');
+  style.setAttribute('data-plugin', '@onlyforchris/dsh-timer-agent');
   style.setAttribute('data-plugin-css', tagId);
   style.textContent = ${JSON.stringify(css)};
   document.head.appendChild(style);
