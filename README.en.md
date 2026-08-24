@@ -6,7 +6,7 @@ A personally maintained [DeepSeek Harness (DSH)](https://deepseek-harness.github
 
 Repo: [onlyforchris/dsh-timer-agent](https://github.com/onlyforchris/dsh-timer-agent) · Release: [v0.1.2](https://github.com/onlyforchris/dsh-timer-agent/releases/tag/v0.1.2)
 
-![New job modal: real workspace target tree + model picker](docs/screenshot.png)
+![New job modal: real workspace target tree + model picker](docs/new-job-modal.png)
 
 ## What it does
 

@@ -6,7 +6,7 @@
 
 仓库：[onlyforchris/dsh-timer-agent](https://github.com/onlyforchris/dsh-timer-agent) · Release：[v0.1.2](https://github.com/onlyforchris/dsh-timer-agent/releases/tag/v0.1.2)
 
-![新建任务：真实工作区目标树 + 模型选择](docs/screenshot.png)
+![新建任务：真实工作区目标树 + 模型选择](docs/new-job-modal.png)
 
 ## 它做什么
 
