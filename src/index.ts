@@ -8,7 +8,11 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+// `ctx.settings` is an optional Cordis service: importing the module only for its
+// type augmentation. The runtime wiring goes through `ctx.inject(['settings'], …)`,
+// never through a named export — `installSettingsSection`/`settingsNamespace` were
+// removed in dsh-settings 0.1.2 and replaced by `settings.installSection`.
+import type {} from '@deepseek-ai/dsh-settings'
 import z from 'schemastery'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { HostPluginContext } from './host/contracts.ts'
@@ -25,8 +29,12 @@ export const inject = ['webServer', 'tools', 'systemPrompt', 'agents']
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
 export const TIMER_AGENT_GUIDANCE = '本机已安装 dsh-timer-agent 插件（定时任务）：60 秒 ticker 在 dsh web 宿主进程常驻，GUI 关闭也会触发。台账在 ~/.dsh/timer-agent/jobs.json。支持 5 段 cron；可指定项目 workdir 或钉住会话；未指定 workdir 时默认跑在 IM 工作区（插件配置 defaultWorkdir）。到点通过真实 agent 会话执行自包含 prompt。可用 timer_agent 工具或侧边栏「定时任务」管理。执行消耗 API 额度；无人在场，prompt 不可提问。'
 
-/** Settings namespace of the plugin's capability. */
-export const TIMER_AGENT_SETTINGS_NAMESPACE = settingsNamespace('timer-agent')
+/**
+ * Settings namespace of the plugin's capability.
+ * A lowercase-hyphenated identifier — dsh-settings validates the literal shape
+ * at compile time and again at registration.
+ */
+export const TIMER_AGENT_SETTINGS_NAMESPACE = 'timer-agent'
 
 /** Plugin config, validated by the same-named schemastery schema. */
 export interface Config {
@@ -109,9 +117,17 @@ export function apply(ctx: Context, config?: Config): void {
     }
   }
 
-  installSettingsSection(ctx, TIMER_AGENT_SETTINGS_NAMESPACE, Config, config ?? {}, {
-    setSource: (source) => { current = source },
-    onChange: sync,
+  // `settings` is an optional service, so it must NOT go in the top-level `inject`
+  // array — that would make the plugin fail to load wherever no provider is
+  // mounted. Going through `ctx.inject` keeps the composition entry (`config`)
+  // authoritative until a provider appears, and falls back to it on detach —
+  // exactly the old `installSettingsSection` contract.
+  const entry: Config = config ?? {}
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsCtx.settings.installSection(ctx, TIMER_AGENT_SETTINGS_NAMESPACE, Config, entry, {
+      setSource: (source) => { current = source },
+      onChange: sync,
+    })
   })
 
   sync()

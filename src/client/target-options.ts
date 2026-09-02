@@ -13,7 +13,10 @@
  * Each group carries its own "new session" leaf (workdir set, sessionId
  * blank); each session leaf pins that conversation (sessionId set).
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+// The client-side context is the ambient cordis `Context`; `dsh-client-runtime`
+// (and its `/client` subpath) was removed in 0.1.2 and folded into
+// `dsh-client-modules`, whose plugin face types the same value as cordis `Context`.
+import type { Context } from '@deepseek-ai/cordis'
 
 /** One pinned-session leaf. */
 export interface TargetSession {
@@ -66,7 +69,7 @@ async function hostWorkspaces(): Promise<WorkspaceRow[]> {
 }
 
 /** Project the client sessions store into flat rows (blank/subagent rows dropped). */
-function sessionRows(ctx: ClientContext): SessionRow[] {
+function sessionRows(ctx: Context): SessionRow[] {
   try {
     // Structural read: the ambient cordis Context augmentation merges several
     // `sessions` seats (the client runtime's ISessions face is the runtime
@@ -158,7 +161,7 @@ function normPath(path: string): string {
  * @param ctx - client root context (sessions face for pinning).
  * @returns ordered groups.
  */
-export async function listTargetOptions(ctx: ClientContext): Promise<TargetGroup[]> {
+export async function listTargetOptions(ctx: Context): Promise<TargetGroup[]> {
   const [workspaces, sessions] = await Promise.all([
     hostWorkspaces(),
     Promise.resolve(sessionRows(ctx)),

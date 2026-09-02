@@ -7,7 +7,10 @@
  *
  * @module dsh-timer-agent/tools
  */
-import { defineTool, type JsonValue } from '@deepseek-ai/dsh-tools'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+// `JsonValue` moved out of `dsh-tools` in 0.1.2; it now lives in `dsh-util-values`,
+// the package `dsh-tools` itself imports it from.
+import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import { randomUUID } from 'node:crypto'
 import { isValidCron, nextRunAtMs } from '../core/schedule.ts'
 import { createJob, withSchedule, withStatus, withRunRequest, type JobRecord } from '../core/jobs.ts'
