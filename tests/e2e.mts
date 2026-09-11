@@ -11,11 +11,17 @@
  *      (succeeded & failed), manual runRequest fast path
  *   4. timer_agent tool actions against a fake registry
  *   5. HTTP route handlers: CRUD + run + loopback fence + bad input
+ *   plus: command jobs (普通任务), fixed-interval mode, and the one-shot
+ *   model — consumption (scheduled + manual), auto-archive on success AND
+ *   failure, skip-while-running non-consumption, the tick race guard on a
+ *   hand-pinned nextRunAt, pause-keeps/resume-reanchors, and nextRunAt /
+ *   runAt pinning across routes and the tool
  */
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isValidCron, nextRunAtMs } from '../src/core/schedule.ts'
+import { splitCommandArgs, truncateOutputTail } from '../src/core/command.ts'
 import { HostJobStore } from '../src/host/store.ts'
 import { TimerRunner } from '../src/host/runner.ts'
 import { registerTimerTool } from '../src/host/tools.ts'
@@ -24,7 +30,7 @@ import type {
   HostAgent, HostAgentHandle, HostPluginContext, HostRoute,
   NodeIncomingMessage, NodeServerResponse,
 } from '../src/host/contracts.ts'
-import { createJob, withSchedule, type JobRecord } from '../src/core/jobs.ts'
+import { commandLine, createJob, jobKind, normalizeTimeoutMs, timeoutLabel, withSchedule, type JobRecord } from '../src/core/jobs.ts'
 
 let passed = 0
 let failed = 0
@@ -89,7 +95,7 @@ const store = new HostJobStore(join(tempDir, 'jobs.json'))
 // ============================================================================
 section('TimerRunner: due firing + at-most-once')
 
-interface FakeCall { kind: 'create' | 'resume' | 'followup' | 'dispose'; sessionId?: string; prompt?: string; cwd?: string }
+interface FakeCall { kind: 'create' | 'resume' | 'followup' | 'dispose' | 'cancel'; sessionId?: string; prompt?: string; cwd?: string }
 
 function makeFakeHost(): { ctx: HostPluginContext; calls: FakeCall[]; emit: (sessionId: string, type: string, data: unknown) => void } {
   const calls: FakeCall[] = []
@@ -105,7 +111,7 @@ function makeFakeHost(): { ctx: HostPluginContext; calls: FakeCall[]; emit: (ses
         // stash the message id so the test can emit its user/message + turn/end
         ;(agent as unknown as { lastMessageId?: string }).lastMessageId = message.id
       },
-      cancel: () => {},
+      cancel: () => { calls.push({ kind: 'cancel', sessionId }) },
     }
     return {
       agent,
@@ -252,54 +258,86 @@ section('TimerRunner: workdir passes cwd to agents.create')
   check('agents.create received meta.cwd=workdir', host.calls.some(c => c.kind === 'create' && c.cwd === 'D:/work/proj'))
 }
 
-section('TimerRunner: defaultWorkdir fills blank job workdir')
+// ============================================================================
+// 3b. run timeout (normalize + runner enforcement)
+// ============================================================================
+section('timeout: normalize + labels')
+check('normalize passes positive ms through', normalizeTimeoutMs(90_000) === 90_000)
+check('normalize rounds fractional ms', normalizeTimeoutMs(90_499.6) === 90_500)
+check('normalize clears zero / negative / NaN / junk',
+  normalizeTimeoutMs(0) === undefined && normalizeTimeoutMs(-5) === undefined
+  && normalizeTimeoutMs(Number.NaN) === undefined && normalizeTimeoutMs('10' as unknown) === undefined)
 {
-  const host = makeFakeHost()
-  const s = new HostJobStore(join(tempDir, 'runner-default-wd.json'))
-  let now = Date.UTC(2026, 0, 1)
-  const runner = new TimerRunner({
-    ctx: host.ctx,
-    store: s,
-    now: () => now,
-    defaultWorkdir: 'D:/DSH/im-workspace',
-  })
-  let job = createJob({ title: 'im', description: '', prompt: 'p', target: { workdir: '', sessionId: '' } }, now, 'job-default-wd')
-  job = withSchedule(job, { enabled: true, cron: '0 * * * *', nextRunAt: now - 1 }, now)
-  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
-  await runner.tick()
-  await new Promise(r => setTimeout(r, 25))
-  check('blank workdir uses plugin defaultWorkdir', host.calls.some(c => c.kind === 'create' && c.cwd === 'D:/DSH/im-workspace'))
+  const base = { title: 't', description: '', prompt: 'p', target: { workdir: '', sessionId: '' } }
+  const withLimit = { ...createJob(base, 0, 'x'), timeoutMs: 90_000 }
+  const unlimited = createJob(base, 0, 'y')
+  check('label: 90s → 1.5m', timeoutLabel(withLimit) === '1.5m')
+  check('label: 120000ms → 2m', timeoutLabel({ ...withLimit, timeoutMs: 120_000 }) === '2m')
+  check('label: 30000ms → 30s', timeoutLabel({ ...withLimit, timeoutMs: 30_000 }) === '30s')
+  check('label: absent → dash', timeoutLabel(unlimited) === '—')
 }
 
-section('TimerRunner: Chinese title → ASCII-only session id (ByteString-safe)')
+section('TimerRunner: run timeout cancels + settles failed')
 {
   const host = makeFakeHost()
-  const s = new HostJobStore(join(tempDir, 'runner-zh-slug.json'))
-  let now = Date.UTC(2026, 7, 24, 2, 0, 0)
+  const s = new HostJobStore(join(tempDir, 'timeout.json'))
+  // Half-past the hour: an hourly cron's next slot is a full hour away, so
+  // the +121s timeout pass cannot coincide with the next scheduled fire.
+  let now = Date.UTC(2026, 0, 1, 0, 30, 0)
   const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
-  let job = createJob({
-    title: '测试',
-    description: '',
-    prompt: '只回复一行：TIMER-SMOKE-OK',
-    target: { workdir: 'D:/DSH/im-workspace', sessionId: '' },
-  }, now, 'job-zh')
+  runner.start()
+  runner.stop()
+
+  let job = createJob({ title: 'slow', description: '', prompt: 'never finishes', target: { workdir: '', sessionId: '' } }, now, 'job-t1')
+  job = withSchedule(job, { enabled: true, cron: '0 * * * *', nextRunAt: now - 1 }, now)
+  job = { ...job, timeoutMs: 120_000 } // 2 minutes
+  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
+
+  await runner.tick()
+  await new Promise(r => setTimeout(r, 25))
+  check('timeout job fired', host.calls.some(c => c.kind === 'followup' && c.prompt === 'never finishes'))
+  check('not yet timed out (deadline in the future)', (await s.load())[0]?.status === 'running')
+
+  now += 121_000 // past the deadline
+  await runner.tick()
+  await new Promise(r => setTimeout(r, 25))
+  const timedOut = (await s.load())[0]
+  check('timeout settles failed with reason', timedOut?.status === 'failed'
+    && timedOut?.executions[0]?.result === 'failed'
+    && typeof timedOut?.executions[0]?.error === 'string' && timedOut.executions[0].error.includes('timed out'),
+    `${timedOut?.status}/${timedOut?.executions[0]?.error}`)
+
+  // A late turn/end cannot double-settle the timed-out execution.
+  const created = host.calls.find(c => c.kind === 'create')
+  const agent = host.agentOf(created!.sessionId!)
+  const messageId = (agent as unknown as { lastMessageId?: string }).lastMessageId
+  host.emit(created!.sessionId!, 'user/message', { id: messageId })
+  host.emit(created!.sessionId!, 'turn/end', { turn: 1, reason: { kind: 'stop' } })
+  await new Promise(r => setTimeout(r, 25))
+  const late = (await s.load())[0]
+  check('late turn/end does not resurrect the run', late?.status === 'failed' && late?.executions.length === 1
+    && late?.executions[0]?.result === 'failed')
+}
+
+section('TimerRunner: unlimited runs never time out')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'notimeout.json'))
+  let now = Date.UTC(2026, 0, 1, 0, 30, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  runner.start()
+  runner.stop()
+
+  let job = createJob({ title: 'endless', description: '', prompt: 'x', target: { workdir: '', sessionId: '' } }, now, 'job-t2')
   job = withSchedule(job, { enabled: true, cron: '0 * * * *', nextRunAt: now - 1 }, now)
   await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
   await runner.tick()
   await new Promise(r => setTimeout(r, 25))
-  const created = host.calls.find(c => c.kind === 'create')
-  const sid = created?.sessionId ?? ''
-  check('create used ASCII session id', /^timer-[a-z0-9-]+-\d{14}$/.test(sid), sid)
-  check('session id has no non-ASCII', [...sid].every(ch => ch.charCodeAt(0) < 128), sid)
-  // Mimic DSH header encoding: undici rejects values > 255
-  let headerOk = true
-  try {
-    // eslint-disable-next-line no-new
-    new Headers({ 'x-deepseek-harness-session-id': sid })
-  } catch {
-    headerOk = false
-  }
-  check('session id is valid HTTP header ByteString', headerOk, sid)
+  now += 10 * 60_000 // past where a short timeout would have fired
+  await runner.tick()
+  await new Promise(r => setTimeout(r, 25))
+  check('no timeout configured → still running', (await s.load())[0]?.status === 'running')
+  check('no cancel was issued', !host.calls.some(c => c.kind === 'cancel'))
 }
 
 // ============================================================================
@@ -327,11 +365,12 @@ section('timer_agent tool actions')
   check('create with invalid cron rejected', typeof badCron.error === 'string')
 
   // good create
-  const created = await tool.execute({ action: 'create', name: 'daily', prompt: 'standup', schedule: '0 9 * * *' }) as { job?: { id?: string } }
+  const created = await tool.execute({ action: 'create', name: 'daily', prompt: 'standup', schedule: '0 9 * * *', timeout_minutes: 5 }) as { job?: { id?: string } }
   const jobId = created.job?.id
   check('create returns job summary', typeof jobId === 'string' && jobId !== '')
   const row = (await s.load())[0]
   check('create persisted armed schedule', row?.schedule?.enabled === true && row?.schedule?.cron === '0 9 * * *')
+  check('create persisted timeout_minutes=5 → 300000ms', row?.timeoutMs === 300_000, `${row?.timeoutMs}`)
 
   // list
   const listed = await tool.execute({ action: 'list' }) as { jobs?: unknown[] }
@@ -348,6 +387,14 @@ section('timer_agent tool actions')
   await tool.execute({ action: 'update', job_id: jobId, prompt: 'new prompt', schedule: '*/30 * * * *' })
   const updated = (await s.load())[0]
   check('update changes prompt + cron', updated?.prompt === 'new prompt' && updated?.schedule?.cron === '*/30 * * * *')
+  await tool.execute({ action: 'update', job_id: jobId, preset: 'alpinario-ops' })
+  check('update pins preset', (await s.load())[0]?.preset === 'alpinario-ops')
+  await tool.execute({ action: 'update', job_id: jobId, preset: '' })
+  check('update preset="" clears it', (await s.load())[0]?.preset === undefined)
+  await tool.execute({ action: 'update', job_id: jobId, timeout_minutes: 0 })
+  check('update timeout_minutes=0 clears the limit', (await s.load())[0]?.timeoutMs === undefined)
+  await tool.execute({ action: 'update', job_id: jobId, timeout_minutes: 2 })
+  check('update timeout_minutes=2 → 120000ms', (await s.load())[0]?.timeoutMs === 120_000)
   const badUpdate = await tool.execute({ action: 'update', job_id: 'nope', prompt: 'x' }) as { error?: string }
   check('update unknown id rejected', typeof badUpdate.error === 'string')
 
@@ -368,7 +415,7 @@ section('HTTP routes: handlers + loopback fence')
   let now = Date.UTC(2026, 0, 1)
   const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
   const routes = makeRoutes({ store: s, runner, ctx: host.ctx, now: () => now })
-  check('four routes composed', routes.length === 4)
+  check('five routes composed', routes.length === 5)
 
   const jobsRoute = routes.find(r => r.path.endsWith('/jobs'))!
   const runRoute = routes.find(r => r.path.endsWith('/jobs/run'))!
@@ -421,6 +468,36 @@ section('HTTP routes: handlers + loopback fence')
     && cronEditedJob.schedule?.cron === '0 10 * * *'
     && cronEditedJob.schedule?.nextRunAt === nextRunAtMs('0 10 * * *', now),
   `${cronEdited.status} ${cronEditedJob.schedule?.nextRunAt}`)
+
+  // PATCH skipNext: rolls nextRunAt forward ONE occurrence (skip the next fire)
+  const skipped = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${id}`, { skipNext: true }), skipped.res)
+  const skippedJob = JSON.parse(skipped.body).job as JobRecord
+  check('PATCH skipNext rolls nextRunAt one occurrence', skipped.status === 200
+    && skippedJob.schedule?.nextRunAt === nextRunAtMs('0 10 * * *', cronEditedJob.schedule?.nextRunAt ?? now),
+  `${skipped.status} ${skippedJob.schedule?.nextRunAt}`)
+  // skipNext on a job without an armed schedule → 400
+  const bareCreated = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', { title: 'skip-bare' }), bareCreated.res)
+  const bareId = (JSON.parse(bareCreated.body).job as JobRecord).id
+  const skipBare = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${bareId}`, { skipNext: true }), skipBare.res)
+  check('PATCH skipNext without armed schedule → 400', skipBare.status === 400)
+  await jobsRoute.handler(makeReq('DELETE', `/api/dsh-timer-agent/jobs?id=${bareId}`), makeRes().res)
+
+  // POST/PATCH timeoutMinutes
+  const toCreated = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', { title: 'to-job', timeoutMinutes: 3 }), toCreated.res)
+  const toId = (JSON.parse(toCreated.body).job as JobRecord).id
+  check('POST /jobs persists timeoutMinutes=3', toCreated.status === 201
+    && (JSON.parse(toCreated.body).job as JobRecord).timeoutMs === 180_000)
+  const toPatched = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${toId}`, { timeoutMinutes: 0 }), toPatched.res)
+  check('PATCH timeoutMinutes=0 clears', toPatched.status === 200 && (JSON.parse(toPatched.body).job as JobRecord).timeoutMs === undefined)
+  const toPatched2 = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${toId}`, { timeoutMinutes: 12 }), toPatched2.res)
+  check('PATCH timeoutMinutes=12 sets 720000ms', (JSON.parse(toPatched2.body).job as JobRecord).timeoutMs === 720_000)
+  await jobsRoute.handler(makeReq('DELETE', `/api/dsh-timer-agent/jobs?id=${toId}`), makeRes().res)
 
   // POST run
   const ran = makeRes()
@@ -497,6 +574,808 @@ section('HTTP routes: handlers + loopback fence')
     modelSelection: { provider: '', model: 'm1' },
   }), badModel.res)
   check('POST /jobs rejects invalid modelSelection', badModel.status === 400)
+
+  // Preset-options route (agentPresets absent → empty roster, still 200)
+  const poRoute = routes.find(r => r.path.endsWith('/preset-options'))!
+  const po = makeRes()
+  await poRoute.handler(makeReq('GET', '/api/dsh-timer-agent/preset-options'), po.res)
+  const poBody = JSON.parse(po.body) as { default?: unknown, presets: unknown[] }
+  check('GET /preset-options → 200 (empty without service)', po.status === 200 && poBody.presets.length === 0)
+
+  // POST /jobs with a preset persists it; PATCH sets and clears it
+  const withPreset = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', {
+    title: 'preset job',
+    target: { workdir: '', sessionId: '' },
+    preset: 'alpinario-ops',
+  }), withPreset.res)
+  const withPresetBody = JSON.parse(withPreset.body) as { job?: JobRecord }
+  const presetJobId = withPresetBody.job?.id
+  check('POST /jobs persists preset', withPreset.status === 201 && withPresetBody.job?.preset === 'alpinario-ops')
+  const presetPatched = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${presetJobId}`, { preset: 'liangshen' }), presetPatched.res)
+  check('PATCH preset updates it', presetPatched.status === 200 && (JSON.parse(presetPatched.body).job as JobRecord).preset === 'liangshen')
+  const presetCleared = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${presetJobId}`, { preset: '' }), presetCleared.res)
+  const presetClearedJob = JSON.parse(presetCleared.body).job as JobRecord
+  check('PATCH preset="" clears it', presetCleared.status === 200 && presetClearedJob.preset === undefined)
+  // Command jobs never carry a preset
+  const cmdPreset = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', {
+    title: 'cmd preset', kind: 'command', command: 'node', preset: 'alpinario-ops',
+  }), cmdPreset.res)
+  check('POST command job ignores preset', cmdPreset.status === 201 && (JSON.parse(cmdPreset.body).job as JobRecord).preset === undefined)
+}
+
+// ============================================================================
+// 6. command jobs (普通任务): arg splitting, model, runner spawn, tool, routes
+// ============================================================================
+section('command: splitCommandArgs')
+check('whitespace split', JSON.stringify(splitCommandArgs('-X utf8 script.py')) === JSON.stringify(['-X', 'utf8', 'script.py']))
+check('double quotes group (with spaces inside)', JSON.stringify(splitCommandArgs('-Command "echo hello world"')) === JSON.stringify(['-Command', 'echo hello world']))
+check('single quotes group literally', JSON.stringify(splitCommandArgs("-Command 'echo hi'")) === JSON.stringify(['-Command', 'echo hi']))
+check('adjacent quoted + bare text merges', JSON.stringify(splitCommandArgs('ab"c d"e')) === JSON.stringify(['abc de']))
+check('escaped quote inside double quotes', JSON.stringify(splitCommandArgs('"a\\"b"')) === JSON.stringify(['a"b']))
+check('unterminated double quote throws', (() => { try { splitCommandArgs('"oops'); return false } catch { return true } })())
+check('unterminated single quote throws', (() => { try { splitCommandArgs("'oops"); return false } catch { return true } })())
+check('empty input → no args', splitCommandArgs('').length === 0 && splitCommandArgs('   ').length === 0)
+check('truncateOutputTail keeps tail with marker', truncateOutputTail('a'.repeat(20), 5) === '…（前 15 字符已省略）\n' + 'a'.repeat(5))
+check('truncateOutputTail passthrough under cap', truncateOutputTail('abc', 5) === 'abc')
+
+section('command: job model + ledger roundtrip')
+{
+  const cmd = createJob({
+    title: 'cmd', description: '', prompt: '',
+    kind: 'command', command: 'node', args: '-e "console.log(1)"',
+    target: { workdir: 'D:/work', sessionId: '' },
+  }, 1000, 'cmd-1')
+  check('createJob stores kind/command/args', jobKind(cmd) === 'command' && cmd.command === 'node' && cmd.args === '-e "console.log(1)"')
+  check('commandLine renders exec line', commandLine(cmd) === 'node -e "console.log(1)"')
+  const agentJob = createJob({ title: 'a', description: '', prompt: 'p', target: { workdir: '', sessionId: '' } }, 1000, 'ag-1')
+  check('agent job stays lean (no kind fields)', jobKind(agentJob) === 'agent' && agentJob.command === undefined && agentJob.args === undefined)
+  check('commandLine of agent job is empty', commandLine(agentJob) === '')
+  check('createJob stores preset (agent)', createJob({
+    title: 'a2', description: '', prompt: 'p', target: { workdir: '', sessionId: '' }, preset: 'liangshen',
+  }, 1000, 'ag-2').preset === 'liangshen')
+  check('createJob drops blank preset', createJob({
+    title: 'a3', description: '', prompt: 'p', target: { workdir: '', sessionId: '' }, preset: '  ',
+  }, 1000, 'ag-3').preset === undefined)
+  check('createJob drops preset on command kind', createJob({
+    title: 'a4', description: '', prompt: '', kind: 'command', command: 'node',
+    target: { workdir: '', sessionId: '' }, preset: 'liangshen',
+  }, 1000, 'ag-4').preset === undefined)
+
+  const file = join(tempDir, 'cmdstore.json')
+  const cs = new HostJobStore(file)
+  await cs.mutate(jobs => ({ jobs: [...jobs, cmd, agentJob], result: true }))
+  const reloaded = await cs.load()
+  check('ledger roundtrip keeps command fields', reloaded.find(j => j.id === 'cmd-1')?.command === 'node'
+    && jobKind(reloaded.find(j => j.id === 'cmd-1')!) === 'command')
+  check('ledger roundtrip keeps agent rows valid', reloaded.find(j => j.id === 'ag-1')?.prompt === 'p')
+
+  // A command execution record (targeting 'command', exitCode, output) survives parseLedger.
+  const withExec = {
+    ...cmd,
+    executions: [{
+      id: 'exec-1', sessionId: undefined, targeting: 'command' as const, startedAt: 1000,
+      endedAt: 2000, result: 'succeeded' as const, error: undefined, exitCode: 0, output: 'hello',
+    }],
+  }
+  await cs.mutate(jobs => ({ jobs: [withExec, agentJob], result: true }))
+  const execReloaded = (await cs.load()).find(j => j.id === 'cmd-1')
+  check('command execution record survives the ledger',
+    execReloaded?.executions[0]?.targeting === 'command'
+    && execReloaded?.executions[0]?.exitCode === 0
+    && execReloaded?.executions[0]?.output === 'hello')
+}
+
+section('TimerRunner: command job fires the real process (success + failure + output)')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'cmdrunner.json'))
+  let now = Date.UTC(2026, 0, 1)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  runner.start()
+  runner.stop()
+
+  let job = createJob({
+    title: 'echo-job', description: '', prompt: '',
+    kind: 'command', command: 'node', args: '-e "console.log(42+1)"',
+    target: { workdir: '', sessionId: '' },
+  }, now, 'job-cmd1')
+  job = withSchedule(job, { enabled: true, cron: '0 * * * *', nextRunAt: now - 1 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
+  const fired = await runner.tick()
+  check('command job fired', fired === 1)
+  // Real spawn: give the process a moment to run and settle.
+  for (let i = 0; i < 40 && ((await s.load())[0]?.executions[0]?.endedAt === undefined); i++) {
+    await new Promise(r => setTimeout(r, 100))
+  }
+  const done = (await s.load())[0]
+  check('command run settles succeeded with exitCode 0', done?.status === 'done'
+    && done?.executions[0]?.result === 'succeeded' && done?.executions[0]?.exitCode === 0,
+    `${done?.status}/${done?.executions[0]?.result}/${done?.executions[0]?.exitCode}`)
+  check('command run captured stdout tail', (done?.executions[0]?.output ?? '').includes('43'),
+    done?.executions[0]?.output)
+  check('command run created no agent session', !host.calls.some(c => c.kind === 'create' || c.kind === 'resume'))
+
+  // Failure: nonzero exit settles failed with the code + stderr in the output.
+  let bad = createJob({
+    title: 'fail-job', description: '', prompt: '',
+    kind: 'command', command: 'node', args: "-e \"console.error('boom'); process.exit(3)\"",
+    target: { workdir: '', sessionId: '' },
+  }, now, 'job-cmd2')
+  await s.mutate(jobs => ({ jobs: [...jobs.filter(j => j.id !== 'job-cmd2'), bad], result: true }))
+  const accepted = await runner.requestRun('job-cmd2')
+  check('manual command run accepted', accepted === true)
+  for (let i = 0; i < 40 && ((await s.load()).find(j => j.id === 'job-cmd2')?.executions[0]?.endedAt === undefined); i++) {
+    await new Promise(r => setTimeout(r, 100))
+  }
+  const failedRun = (await s.load()).find(j => j.id === 'job-cmd2')
+  check('nonzero exit settles failed with code 3', failedRun?.status === 'failed'
+    && failedRun?.executions[0]?.result === 'failed' && failedRun?.executions[0]?.exitCode === 3,
+    `${failedRun?.status}/${failedRun?.executions[0]?.result}/${failedRun?.executions[0]?.exitCode}`)
+  check('stderr captured in output tail', (failedRun?.executions[0]?.output ?? '').includes('boom'))
+}
+
+section('TimerRunner: command timeout kills the process and settles failed')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'cmdtimeout.json'))
+  let now = Date.UTC(2026, 0, 1, 0, 30, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  runner.start()
+  runner.stop()
+
+  let job = createJob({
+    title: 'slow-cmd', description: '', prompt: '',
+    kind: 'command', command: 'node', args: '-e "setTimeout(()=>{}, 600000)"',
+    target: { workdir: '', sessionId: '' },
+  }, now, 'job-cmd-t')
+  job = withSchedule(job, { enabled: true, cron: '0 * * * *', nextRunAt: now - 1 }, now)
+  job = { ...job, timeoutMs: 120_000 } // 2 minutes
+  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
+  await runner.tick()
+  await new Promise(r => setTimeout(r, 100))
+  check('slow command is running', (await s.load())[0]?.status === 'running')
+
+  now += 121_000 // past the deadline
+  await runner.tick()
+  await new Promise(r => setTimeout(r, 200))
+  const timedOut = (await s.load())[0]
+  check('command timeout settles failed with reason', timedOut?.status === 'failed'
+    && typeof timedOut?.executions[0]?.error === 'string' && timedOut.executions[0].error.includes('timed out'),
+    `${timedOut?.status}/${timedOut?.executions[0]?.error}`)
+}
+
+section('timer_agent tool: command create / update / run')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'cmdtool.json'))
+  let now = Date.UTC(2026, 0, 1)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  const registered: unknown[] = []
+  registerTimerTool({ register: (def: unknown) => { registered.push(def); return () => {} } }, { store: s, runner, now: () => now })
+  const tool = registered[0] as {
+    name: string
+    execute(args: Record<string, string | number | undefined>): Promise<Record<string, unknown>>
+  }
+
+  const badCmd = await tool.execute({ action: 'create', kind: 'command', schedule: '0 9 * * *', command: '' }) as { error?: string }
+  check('command create without command rejected', typeof badCmd.error === 'string')
+  const created = await tool.execute({
+    action: 'create', kind: 'command', name: 'daily-script',
+    command: 'node', args: '-e "console.log(7)"', schedule: '0 9 * * *', timeout_minutes: 10,
+  }) as { job?: { id?: string, job_kind?: string, command?: string, args?: string } }
+  const cmdId = created.job?.id
+  check('command create returns kind/command summary',
+    typeof cmdId === 'string' && created.job?.job_kind === 'command' && created.job?.command === 'node')
+  const row = (await s.load())[0]
+  check('command create persisted exec fields + timeout', row?.command === 'node'
+    && row?.args === '-e "console.log(7)"' && row?.timeoutMs === 600_000)
+
+  // update: change args; switch kind agent→command on an agent job.
+  await tool.execute({ action: 'update', job_id: cmdId, args: '-e "console.log(8)"' })
+  check('update args', (await s.load())[0]?.args === '-e "console.log(8)"')
+
+  // run: fires the real command.
+  await tool.execute({ action: 'run', job_id: cmdId })
+  for (let i = 0; i < 40 && ((await s.load())[0]?.executions[0]?.endedAt === undefined); i++) {
+    await new Promise(r => setTimeout(r, 100))
+  }
+  const ranRow = (await s.load())[0]
+  check('tool run executed the command successfully', ranRow?.status === 'done'
+    && ranRow?.executions[0]?.targeting === 'command'
+    && (ranRow?.executions[0]?.output ?? '').includes('8'),
+    `${ranRow?.status}/${ranRow?.executions[0]?.output}`)
+}
+
+section('HTTP routes: command job create / patch / validate')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'cmdroutes.json'))
+  let now = Date.UTC(2026, 0, 1)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  const routes = makeRoutes({ store: s, runner, ctx: host.ctx, now: () => now })
+  const jobsRoute = routes.find(r => r.path.endsWith('/jobs'))!
+
+  const { Readable, Writable } = await import('node:stream')
+  function makeReq(method: string, url: string, body?: unknown): NodeIncomingMessage {
+    const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]) as unknown as NodeIncomingMessage
+    Object.assign(req, { method, url, headers: { host: '127.0.0.1:3080' }, socket: { remoteAddress: '127.0.0.1' } })
+    return req
+  }
+  function makeRes(): { res: NodeServerResponse; status: number; body: string } {
+    const state = { status: 0, body: '' }
+    const res = new Writable({ write(chunk, _enc, cb) { state.body += chunk.toString(); cb() } }) as unknown as NodeServerResponse
+    Object.assign(res, { writeHead: (status: number) => { state.status = status }, end: (chunk?: string | Buffer) => { if (chunk !== undefined) state.body += chunk.toString() } })
+    return { res, get status() { return state.status }, get body() { return state.body } }
+  }
+
+  // POST a command job
+  const created = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', {
+    title: 'r-cmd', kind: 'command', command: 'python', args: '-X utf8 temu_yh_yinhua.py',
+    target: { workdir: 'D:/workspace/dsh/ziniao', sessionId: '' }, cron: '30 9 * * *',
+  }), created.res)
+  const createdJob = JSON.parse(created.body).job as JobRecord
+  check('POST /jobs command → 201 with fields', created.status === 201
+    && createdJob.kind === 'command' && createdJob.command === 'python' && createdJob.args === '-X utf8 temu_yh_yinhua.py')
+  check('POST /jobs command arms the schedule', createdJob.schedule?.enabled === true && createdJob.schedule?.cron === '30 9 * * *')
+
+  // POST a command job without a command → 400
+  const bad = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', { title: 'x', kind: 'command', command: '' }), bad.res)
+  check('POST command job without command → 400', bad.status === 400, `${bad.status}`)
+
+  // PATCH the command line + workdir
+  const patched = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${createdJob.id}`, {
+    command: 'pwsh', args: '-NoProfile -Command "echo hi"', target: { workdir: 'D:/other', sessionId: '' },
+  }), patched.res)
+  const patchedJob = JSON.parse(patched.body).job as JobRecord
+  check('PATCH command/args/workdir', patched.status === 200
+    && patchedJob.command === 'pwsh' && patchedJob.args === '-NoProfile -Command "echo hi"'
+    && patchedJob.target.workdir === 'D:/other')
+
+  // PATCH kind switch: agent → command requires a command
+  const agentCreated = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', { title: 'to-convert', prompt: 'p' }), agentCreated.res)
+  const agentId = (JSON.parse(agentCreated.body).job as JobRecord).id
+  const converted = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${agentId}`, {
+    kind: 'command', command: 'node', args: '-v',
+  }), converted.res)
+  const convertedJob = JSON.parse(converted.body).job as JobRecord
+  check('PATCH kind agent→command converts', converted.status === 200
+    && convertedJob.kind === 'command' && convertedJob.command === 'node')
+  const reverted = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${agentId}`, { kind: 'agent' }), reverted.res)
+  const revertedJob = JSON.parse(reverted.body).job as JobRecord
+  check('PATCH kind command→agent clears exec fields', reverted.status === 200
+    && revertedJob.kind === undefined && revertedJob.command === undefined && revertedJob.args === undefined)
+}
+
+// ============================================================================
+// 8. fixed-interval schedule mode (ported from cloudcli-timer-agent)
+// ============================================================================
+const INTERVAL_MIN = 60_000
+section('TimerRunner: interval mode fires + rolls the grid from the fired instant')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'runner-interval.json'))
+  let now = Date.UTC(2026, 0, 1, 0, 0, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  runner.start()
+  runner.stop()
+
+  // Interval job whose nextRunAt is a day stale (host was down): the grid
+  // advances from the FIRED instant, not from "now" (no drift).
+  const firedAt = now - 24 * 60 * INTERVAL_MIN
+  let job = createJob({ title: 'every-302', description: '', prompt: 'go', target: { workdir: '', sessionId: '' } }, now, 'job-int')
+  job = withSchedule(job, { enabled: true, cron: '', intervalMinutes: 302, nextRunAt: firedAt }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
+
+  const fired = await runner.tick()
+  await new Promise(r => setTimeout(r, 25))
+  check('interval job fired', fired === 1, `fired=${fired}`)
+  const row = (await s.load())[0]
+  check('grid advanced from the fired instant (firedAt + N), not now + N',
+    row?.schedule?.nextRunAt === firedAt + 302 * INTERVAL_MIN,
+    `${row?.schedule?.nextRunAt} vs ${firedAt + 302 * INTERVAL_MIN}`)
+  check('lastTriggeredAt stamped with the fire time', row?.schedule?.lastTriggeredAt === now)
+
+  // Settle the run, then a manual run re-anchors the grid (下次 = 手动时刻 + N).
+  const created = host.calls.find(c => c.kind === 'create')
+  const agent = host.agentOf(created!.sessionId!)
+  const messageId = (agent as unknown as { lastMessageId?: string }).lastMessageId
+  host.emit(created!.sessionId!, 'user/message', { id: messageId })
+  host.emit(created!.sessionId!, 'turn/end', { turn: 1, reason: { kind: 'stop' } })
+  await new Promise(r => setTimeout(r, 25))
+
+  now += 7 * INTERVAL_MIN
+  const accepted = await runner.requestRun('job-int')
+  const afterManual = (await s.load())[0]
+  check('manual run accepted', accepted === true)
+  check('manual run re-anchors the interval grid (now + N)',
+    afterManual?.schedule?.nextRunAt === now + 302 * INTERVAL_MIN
+    && afterManual?.schedule?.lastTriggeredAt === now,
+    `${afterManual?.schedule?.nextRunAt}`)
+}
+
+section('HTTP routes: interval create / mode switch / arm / skip')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'routes-interval.json'))
+  let now = Date.UTC(2026, 0, 1)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  const routes = makeRoutes({ store: s, runner, ctx: host.ctx, now: () => now })
+  const jobsRoute = routes.find(r => r.path.endsWith('/jobs'))!
+
+  const { Readable, Writable } = await import('node:stream')
+  function makeReq(method: string, url: string, body?: unknown): NodeIncomingMessage {
+    const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]) as unknown as NodeIncomingMessage
+    Object.assign(req, { method, url, headers: { host: '127.0.0.1:3080' }, socket: { remoteAddress: '127.0.0.1' } })
+    return req
+  }
+  function makeRes(): { res: NodeServerResponse; status: number; body: string } {
+    const state = { status: 0, body: '' }
+    const res = new Writable({ write(chunk, _enc, cb) { state.body += chunk.toString(); cb() } }) as unknown as NodeServerResponse
+    Object.assign(res, { writeHead: (status: number) => { state.status = status }, end: (chunk?: string | Buffer) => { if (chunk !== undefined) state.body += chunk.toString() } })
+    return { res, get status() { return state.status }, get body() { return state.body } }
+  }
+
+  // POST create in interval mode: armed, cron cleared, next run = now + N.
+  const created = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', {
+    title: 'r-int', prompt: 'p', intervalMinutes: 90, target: { workdir: '', sessionId: '' },
+  }), created.res)
+  const createdJob = JSON.parse(created.body).job as JobRecord
+  check('POST intervalMinutes → 201 armed in interval mode', created.status === 201
+    && createdJob.schedule?.enabled === true && createdJob.schedule?.intervalMinutes === 90
+    && createdJob.schedule?.cron === '')
+  check('POST interval nextRunAt = now + N', createdJob.schedule?.nextRunAt === now + 90 * INTERVAL_MIN)
+
+  const id = createdJob.id
+  // PATCH back to cron mode (intervalMinutes: 0 + explicit cron).
+  const toCron = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${id}`, {
+    intervalMinutes: 0, cron: '0 9 * * *',
+  }), toCron.res)
+  const cronJob = JSON.parse(toCron.body).job as JobRecord
+  check('PATCH intervalMinutes=0 + cron → cron mode', toCron.status === 200
+    && cronJob.schedule?.intervalMinutes === undefined && cronJob.schedule?.cron === '0 9 * * *')
+
+  // PATCH to interval mode: a still-future nextRunAt is kept (hand-pinned
+  // first-run semantics), only the mode fields flip.
+  const cronNext = cronJob.schedule?.nextRunAt
+  const toInterval = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${id}`, { intervalMinutes: 30 }), toInterval.res)
+  const intJob = JSON.parse(toInterval.body).job as JobRecord
+  check('PATCH intervalMinutes=30 → interval mode, cron cleared', toInterval.status === 200
+    && intJob.schedule?.intervalMinutes === 30 && intJob.schedule?.cron === '')
+  check('still-future nextRunAt kept on the mode switch', intJob.schedule?.nextRunAt === cronNext)
+
+  // Disarm + re-arm: interval grid re-arms from now.
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${id}`, { scheduleEnabled: false }), makeRes().res)
+  const rearm = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${id}`, { scheduleEnabled: true }), rearm.res)
+  const armedJob = JSON.parse(rearm.body).job as JobRecord
+  check('re-arm schedules the interval from now', rearm.status === 200
+    && armedJob.schedule?.enabled === true && armedJob.schedule?.nextRunAt === now + 30 * INTERVAL_MIN)
+
+  // Skip-once: one whole interval forward from the displayed slot.
+  const skip = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${id}`, { skipNext: true }), skip.res)
+  const skippedJob = JSON.parse(skip.body).job as JobRecord
+  check('skipNext rolls one interval (base + N)', skip.status === 200
+    && skippedJob.schedule?.nextRunAt === now + 60 * INTERVAL_MIN)
+}
+
+section('timer_agent tool: interval_minutes create / update / resume')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'tool-interval.json'))
+  let now = Date.UTC(2026, 0, 1)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  const registered: unknown[] = []
+  const disposer = registerTimerTool({ register: (def: unknown) => { registered.push(def); return () => {} } }, { store: s, runner, now: () => now })
+  const tool = registered[0] as { execute(args: Record<string, unknown>): Promise<Record<string, unknown>> }
+
+  const created = await tool.execute({ action: 'create', name: 'every-302', prompt: 'loop', interval_minutes: 302 }) as { job?: { schedule?: { interval_minutes?: number; cron?: string } } }
+  const row = (await s.load())[0]
+  check('create with interval_minutes arms the interval (cron cleared)',
+    row?.schedule?.intervalMinutes === 302 && row?.schedule?.cron === '' && row?.schedule?.enabled === true)
+  check('create summary reports interval_minutes', created.job?.schedule?.interval_minutes === 302)
+  const jobId = (await s.load())[0]?.id ?? ''
+
+  // Switch back to cron, then to a different interval.
+  await tool.execute({ action: 'update', job_id: jobId, interval_minutes: 0, schedule: '0 9 * * *' })
+  const cronRow = (await s.load())[0]
+  check('update interval_minutes=0 + schedule → cron mode',
+    cronRow?.schedule?.intervalMinutes === undefined && cronRow?.schedule?.cron === '0 9 * * *')
+  await tool.execute({ action: 'update', job_id: jobId, interval_minutes: 60 })
+  const intRow = (await s.load())[0]
+  check('update interval_minutes=60 → interval mode, armed from now',
+    intRow?.schedule?.intervalMinutes === 60 && intRow?.schedule?.cron === ''
+    && intRow?.schedule?.nextRunAt === now + 60 * INTERVAL_MIN)
+
+  // Pause / resume re-arms the interval grid from now.
+  await tool.execute({ action: 'pause', job_id: jobId })
+  check('pause disarms', (await s.load())[0]?.schedule?.enabled === false)
+  await tool.execute({ action: 'resume', job_id: jobId })
+  const resumed = (await s.load())[0]
+  check('resume re-arms the interval from now', resumed?.schedule?.enabled === true
+    && resumed?.schedule?.nextRunAt === now + 60 * INTERVAL_MIN)
+
+  disposer()
+}
+
+// ============================================================================
+// 9. one-shot jobs (execution rides the persisted nextRunAt)
+// ============================================================================
+section('TimerRunner: one-shot fires once, consumes nextRunAt, archives')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'runner-oneshot.json'))
+  let now = Date.UTC(2026, 0, 1, 0, 0, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  runner.start()
+  runner.stop()
+
+  let job = createJob({ title: 'once', description: '', prompt: 'one time only', target: { workdir: '', sessionId: '' } }, now, 'job-once')
+  job = withSchedule(job, { enabled: true, cron: '', nextRunAt: now - 1 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
+
+  const fired = await runner.tick()
+  await new Promise(r => setTimeout(r, 25))
+  check('one-shot fired once', fired === 1 && host.calls.filter(c => c.kind === 'create').length === 1)
+  const armed = (await s.load())[0]
+  check('nextRunAt consumed atomically at fire time', armed?.schedule?.nextRunAt === undefined
+    && armed?.schedule?.lastTriggeredAt === now, JSON.stringify(armed?.schedule))
+  check('no grid rolled (a one-shot has none)', armed?.status === 'running')
+
+  // Settle succeeded → archived, not done.
+  const created = host.calls.find(c => c.kind === 'create')
+  const agent = host.agentOf(created!.sessionId!)
+  const messageId = (agent as unknown as { lastMessageId?: string }).lastMessageId
+  host.emit(created!.sessionId!, 'user/message', { id: messageId })
+  host.emit(created!.sessionId!, 'turn/end', { turn: 1, reason: { kind: 'stop' } })
+  await new Promise(r => setTimeout(r, 25))
+  const settled = (await s.load())[0]
+  check('succeeded one-shot settles archived', settled?.status === 'archived'
+    && settled?.executions[0]?.result === 'succeeded', `${settled?.status}`)
+  check('consumed one-shot never re-fires', await runner.tick() === 0)
+}
+
+section('TimerRunner: failed one-shot archives + skip-while-running does not consume')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'runner-oneshot2.json'))
+  let now = Date.UTC(2026, 0, 1, 0, 0, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  runner.start()
+  runner.stop()
+
+  // A RUNNING job with a due one-shot: the fire is skipped AND the shot stays
+  // armed — the next tick retries (same skip-while-running as recurring).
+  let busy = createJob({ title: 'busy-once', description: '', prompt: 'x', target: { workdir: '', sessionId: '' } }, now, 'job-once-busy')
+  busy = withSchedule({ ...busy, status: 'running' }, { enabled: true, cron: '', nextRunAt: now - 1 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, busy], result: true }))
+  const skipped = await runner.tick()
+  const busyRow = (await s.load()).find(j => j.id === 'job-once-busy')
+  check('skip-while-running leaves a due one-shot armed', skipped === 0
+    && busyRow?.schedule?.nextRunAt === now - 1, `${busyRow?.schedule?.nextRunAt}`)
+
+  // A due one-shot whose run FAILS still archives (the shot is consumed).
+  let bad = createJob({ title: 'bad-once', description: '', prompt: 'boom', target: { workdir: '', sessionId: '' } }, now, 'job-once-bad')
+  bad = withSchedule(bad, { enabled: true, cron: '', nextRunAt: now - 1 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, bad], result: true }))
+  await runner.tick()
+  await new Promise(r => setTimeout(r, 25))
+  const fired = host.calls.find(c => c.kind === 'followup' && c.prompt === 'boom')
+  const agent = host.agentOf(fired!.sessionId!)
+  const messageId = (agent as unknown as { lastMessageId?: string }).lastMessageId
+  host.emit(fired!.sessionId!, 'user/message', { id: messageId })
+  host.emit(fired!.sessionId!, 'turn/end', { turn: 1, reason: { kind: 'error', error: { message: 'boom' } } })
+  await new Promise(r => setTimeout(r, 25))
+  const failedRow = (await s.load()).find(j => j.id === 'job-once-bad')
+  check('failed one-shot settles archived too', failedRow?.status === 'archived'
+    && failedRow?.executions[0]?.result === 'failed', `${failedRow?.status}`)
+}
+
+section('TimerRunner: a manual run consumes a one-shot')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'runner-oneshot3.json'))
+  let now = Date.UTC(2026, 0, 1, 0, 0, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  runner.start()
+  runner.stop()
+
+  let job = createJob({ title: 'manual-once', description: '', prompt: 'later', target: { workdir: '', sessionId: '' } }, now, 'job-once-manual')
+  job = withSchedule(job, { enabled: true, cron: '', nextRunAt: now + 60 * 60_000 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
+
+  const accepted = await runner.requestRun('job-once-manual')
+  await new Promise(r => setTimeout(r, 25))
+  const row = (await s.load())[0]
+  check('manual run accepted and spent the pending shot', accepted === true
+    && row?.schedule?.nextRunAt === undefined && row?.schedule?.lastTriggeredAt === now,
+  `${accepted}/${JSON.stringify(row?.schedule)}`)
+
+  // The spent shot cannot fire on schedule afterwards.
+  now += 2 * 60 * 60_000
+  check('a consumed one-shot never fires on schedule', await runner.tick() === 0)
+
+  // The manual run settles → archived like any consumed one-shot.
+  const created = host.calls.find(c => c.kind === 'create')
+  const agent = host.agentOf(created!.sessionId!)
+  const messageId = (agent as unknown as { lastMessageId?: string }).lastMessageId
+  host.emit(created!.sessionId!, 'user/message', { id: messageId })
+  host.emit(created!.sessionId!, 'turn/end', { turn: 1, reason: { kind: 'stop' } })
+  await new Promise(r => setTimeout(r, 25))
+  check('manual-run one-shot archives after settling', (await s.load())[0]?.status === 'archived')
+}
+
+section('TimerRunner: tick race guard keeps a hand-pinned nextRunAt')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'runner-race.json'))
+  let now = Date.UTC(2026, 0, 1, 0, 0, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  runner.start()
+  runner.stop()
+
+  let job = createJob({ title: 'racy', description: '', prompt: 'p', target: { workdir: '', sessionId: '' } }, now, 'job-race')
+  job = withSchedule(job, { enabled: true, cron: '0 * * * *', nextRunAt: now - 1 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, job], result: true }))
+
+  // Simulate the user hand-pinning nextRunAt between tick's snapshot and the
+  // roll mutate: every mutate's fresh view of the ledger carries the pinned
+  // instant instead of the one that fired.
+  type StoreMutate = (fn: (jobs: JobRecord[]) => { jobs: JobRecord[]; result: unknown } | undefined) => Promise<unknown>
+  const originalMutate: StoreMutate = s.mutate.bind(s)
+  const pinned = now + 5 * 60_000
+  ;(s as unknown as { mutate: StoreMutate }).mutate = fn =>
+    originalMutate(current => fn(current.map(candidate =>
+      candidate.id === 'job-race' && candidate.schedule !== undefined
+        ? { ...candidate, schedule: { ...candidate.schedule, nextRunAt: pinned } }
+        : candidate)))
+  const fired = await runner.tick()
+  ;(s as unknown as { mutate: StoreMutate }).mutate = originalMutate
+  await new Promise(r => setTimeout(r, 25))
+  const row = (await s.load())[0]
+  check('the fire still went through (the guard skips the roll, not the run)', fired === 1
+    && host.calls.some(c => c.kind === 'create'))
+  check('the roll did not clobber the hand-pinned instant', row?.schedule?.nextRunAt === pinned,
+    `${row?.schedule?.nextRunAt} vs ${pinned}`)
+  check('the fire still stamped lastTriggeredAt', row?.schedule?.lastTriggeredAt === now)
+}
+
+// ============================================================================
+// 10. routes: pause keeps nextRunAt / resume re-anchors on the real last
+//     execution / nextRunAt pinning / one-shot create (runAt)
+// ============================================================================
+section('HTTP routes: pause keeps nextRunAt, resume re-anchors on the real last execution')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'routes-resume.json'))
+  let now = Date.UTC(2026, 0, 1, 0, 0, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  const routes = makeRoutes({ store: s, runner, ctx: host.ctx, now: () => now })
+  const jobsRoute = routes.find(r => r.path.endsWith('/jobs'))!
+
+  const { Readable, Writable } = await import('node:stream')
+  function makeReq(method: string, url: string, body?: unknown): NodeIncomingMessage {
+    const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]) as unknown as NodeIncomingMessage
+    Object.assign(req, { method, url, headers: { host: '127.0.0.1:3080' }, socket: { remoteAddress: '127.0.0.1' } })
+    return req
+  }
+  function makeRes(): { res: NodeServerResponse; status: number; body: string } {
+    const state = { status: 0, body: '' }
+    const res = new Writable({ write(chunk, _enc, cb) { state.body += chunk.toString(); cb() } }) as unknown as NodeServerResponse
+    Object.assign(res, { writeHead: (status: number) => { state.status = status }, end: (chunk?: string | Buffer) => { if (chunk !== undefined) state.body += chunk.toString() } })
+    return { res, get status() { return state.status }, get body() { return state.body } }
+  }
+
+  // --- interval: a real execution anchors the resume grid ---
+  const now0 = now
+  const created = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', {
+    title: 'resume-int', prompt: 'p', intervalMinutes: 30, target: { workdir: '', sessionId: '' },
+  }), created.res)
+  const intId = (JSON.parse(created.body).job as JobRecord).id
+  // A real execution at now0 (the manual run re-anchored the grid too).
+  check('interval job running with a real execution', await runner.requestRun(intId) === true)
+
+  const paused = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${intId}`, { scheduleEnabled: false }), paused.res)
+  const pausedJob = JSON.parse(paused.body).job as JobRecord
+  check('pause keeps the persisted nextRunAt', paused.status === 200
+    && pausedJob.schedule?.enabled === false
+    && pausedJob.schedule?.nextRunAt === now0 + 30 * INTERVAL_MIN,
+  `${pausedJob.schedule?.nextRunAt}`)
+
+  now = now0 + 110 * INTERVAL_MIN // a long paused gap, well past one slot
+  const resumed = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${intId}`, { scheduleEnabled: true }), resumed.res)
+  const resumedJob = JSON.parse(resumed.body).job as JobRecord
+  check('interval resume anchors on the real last execution (no replay)',
+    resumed.status === 200 && resumedJob.schedule?.enabled === true
+    && resumedJob.schedule?.nextRunAt === now0 + 120 * INTERVAL_MIN,
+  `${resumedJob.schedule?.nextRunAt}`)
+
+  // --- cron: a slot missed while paused is skipped, next is after NOW ---
+  now = Date.UTC(2026, 0, 2, 10, 0, 0)
+  const today9 = new Date(2026, 0, 2, 9, 0, 0).getTime()
+  const tomorrow9 = new Date(2026, 0, 3, 9, 0, 0).getTime()
+  let cronJob = createJob({ title: 'resume-cron', description: '', prompt: 'p', target: { workdir: '', sessionId: '' } }, now, 'job-resume-cron')
+  cronJob = withSchedule(cronJob, {
+    enabled: true, cron: '0 9 * * *', nextRunAt: today9, lastTriggeredAt: today9 - 24 * 60 * 60_000,
+  }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, cronJob], result: true }))
+  await jobsRoute.handler(makeReq('PATCH', '/api/dsh-timer-agent/jobs?id=job-resume-cron', { scheduleEnabled: false }), makeRes().res)
+  const cronPaused = (await s.load()).find(j => j.id === 'job-resume-cron')
+  check('cron pause keeps the (now stale) nextRunAt', cronPaused?.schedule?.enabled === false
+    && cronPaused?.schedule?.nextRunAt === today9)
+  const cronResumed = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', '/api/dsh-timer-agent/jobs?id=job-resume-cron', { scheduleEnabled: true }), cronResumed.res)
+  const cronResumedJob = JSON.parse(cronResumed.body).job as JobRecord
+  check('cron resume skips the missed slot, takes the next after now',
+    cronResumed.status === 200 && cronResumedJob.schedule?.nextRunAt === tomorrow9,
+  `${cronResumedJob.schedule?.nextRunAt}`)
+}
+
+section('HTTP routes: one-shot create (runAt) / nextRunAt pinning / one-shot skip+restart')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'routes-oneshot.json'))
+  let now = Date.UTC(2026, 0, 1, 0, 0, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  const routes = makeRoutes({ store: s, runner, ctx: host.ctx, now: () => now })
+  const jobsRoute = routes.find(r => r.path.endsWith('/jobs'))!
+
+  const { Readable, Writable } = await import('node:stream')
+  function makeReq(method: string, url: string, body?: unknown): NodeIncomingMessage {
+    const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]) as unknown as NodeIncomingMessage
+    Object.assign(req, { method, url, headers: { host: '127.0.0.1:3080' }, socket: { remoteAddress: '127.0.0.1' } })
+    return req
+  }
+  function makeRes(): { res: NodeServerResponse; status: number; body: string } {
+    const state = { status: 0, body: '' }
+    const res = new Writable({ write(chunk, _enc, cb) { state.body += chunk.toString(); cb() } }) as unknown as NodeServerResponse
+    Object.assign(res, { writeHead: (status: number) => { state.status = status }, end: (chunk?: string | Buffer) => { if (chunk !== undefined) state.body += chunk.toString() } })
+    return { res, get status() { return state.status }, get body() { return state.body } }
+  }
+
+  // POST runAt (ISO string) → one-shot: armed, blank cron, nextRunAt = runAt.
+  const onceIso = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', {
+    title: 'once-route', prompt: 'p', runAt: new Date(now + 60_000).toISOString(),
+  }), onceIso.res)
+  const onceJob = JSON.parse(onceIso.body).job as JobRecord
+  check('POST runAt (ISO) → 201 one-shot schedule', onceIso.status === 201
+    && onceJob.schedule?.enabled === true && onceJob.schedule?.cron === ''
+    && onceJob.schedule?.nextRunAt === now + 60_000)
+  // POST runAt (ms epoch number) parses too.
+  const onceMs = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', { title: 'once-ms', runAt: now + 120_000 }), onceMs.res)
+  check('POST runAt (ms epoch) parses', onceMs.status === 201
+    && (JSON.parse(onceMs.body).job as JobRecord).schedule?.nextRunAt === now + 120_000)
+  // interval > runAt precedence: runAt silently ignored.
+  const precedence = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', {
+    title: 'once-ignored', intervalMinutes: 10, runAt: now + 999_000,
+  }), precedence.res)
+  const precedenceJob = JSON.parse(precedence.body).job as JobRecord
+  check('POST intervalMinutes + runAt → runAt ignored', precedence.status === 201
+    && precedenceJob.schedule?.intervalMinutes === 10
+    && precedenceJob.schedule?.nextRunAt === now + 10 * INTERVAL_MIN)
+  // Invalid runAt → 400; no schedule field at all stays unscheduled.
+  const badRunAt = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', { title: 'once-bad', runAt: 'garbage' }), badRunAt.res)
+  check('POST invalid runAt → 400', badRunAt.status === 400, `${badRunAt.status}`)
+  const bare = makeRes()
+  await jobsRoute.handler(makeReq('POST', '/api/dsh-timer-agent/jobs', { title: 'no-schedule' }), bare.res)
+  check('POST without cron/interval/runAt stays unscheduled', bare.status === 201
+    && (JSON.parse(bare.body).job as JobRecord).schedule === undefined)
+
+  // PATCH nextRunAt: one-shot accepts (ISO + number), cron refuses, no
+  // schedule refuses.
+  const pinned = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${onceJob.id}`, { nextRunAt: now + 3_600_000 }), pinned.res)
+  check('PATCH nextRunAt pins a one-shot', pinned.status === 200
+    && (JSON.parse(pinned.body).job as JobRecord).schedule?.nextRunAt === now + 3_600_000)
+  const pinnedIso = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${onceJob.id}`, {
+    nextRunAt: new Date(now + 7_200_000).toISOString(),
+  }), pinnedIso.res)
+  check('PATCH nextRunAt (ISO) pins a one-shot', pinnedIso.status === 200
+    && (JSON.parse(pinnedIso.body).job as JobRecord).schedule?.nextRunAt === now + 7_200_000)
+
+  let cronRow = createJob({ title: 'pin-cron', description: '', prompt: 'p', target: { workdir: '', sessionId: '' } }, now, 'job-pin-cron')
+  cronRow = withSchedule(cronRow, { enabled: true, cron: '0 9 * * *', nextRunAt: now + 60_000 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, cronRow], result: true }))
+  const pinnedCron = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', '/api/dsh-timer-agent/jobs?id=job-pin-cron', { nextRunAt: now + 999_000 }), pinnedCron.res)
+  check('PATCH nextRunAt on a cron job → 400', pinnedCron.status === 400, `${pinnedCron.status}`)
+
+  const bareId = (JSON.parse(bare.body).job as JobRecord).id
+  const pinnedBare = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${bareId}`, { nextRunAt: now + 999_000 }), pinnedBare.res)
+  check('PATCH nextRunAt without a schedule → 400', pinnedBare.status === 400, `${pinnedBare.status}`)
+
+  // skipNext on a one-shot → 400 (nothing to skip without spending the shot).
+  const skipOnce = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', `/api/dsh-timer-agent/jobs?id=${onceJob.id}`, { skipNext: true }), skipOnce.res)
+  check('PATCH skipNext on a one-shot → 400', skipOnce.status === 400, `${skipOnce.status}`)
+
+  // restart on a consumed one-shot: back to idle, schedule stays as-is.
+  let spent = createJob({ title: 'spent-once', description: '', prompt: 'p', target: { workdir: '', sessionId: '' } }, now, 'job-once-spent')
+  spent = withSchedule({ ...spent, status: 'archived' }, { enabled: true, cron: '', nextRunAt: undefined, lastTriggeredAt: now - 1_000 }, now)
+  await s.mutate(jobs => ({ jobs: [...jobs, spent], result: true }))
+  const restarted = makeRes()
+  await jobsRoute.handler(makeReq('PATCH', '/api/dsh-timer-agent/jobs?id=job-once-spent', { restart: true }), restarted.res)
+  const restartedJob = JSON.parse(restarted.body).job as JobRecord
+  check('restart of a consumed one-shot → idle, no re-arm', restarted.status === 200
+    && restartedJob.status === 'idle' && restartedJob.schedule?.enabled === false
+    && restartedJob.schedule?.nextRunAt === undefined,
+  `${restarted.status}/${restartedJob.schedule?.nextRunAt}`)
+}
+
+// ============================================================================
+// 11. timer_agent tool: run_at one-shot create / next_run_at pin / pause-resume
+// ============================================================================
+section('timer_agent tool: run_at create, next_run_at pin, pause/resume keep')
+{
+  const host = makeFakeHost()
+  const s = new HostJobStore(join(tempDir, 'tool-oneshot.json'))
+  let now = Date.UTC(2026, 0, 1, 0, 0, 0)
+  const runner = new TimerRunner({ ctx: host.ctx, store: s, now: () => now })
+  const registered: unknown[] = []
+  const disposer = registerTimerTool({ register: (def: unknown) => { registered.push(def); return () => {} } }, { store: s, runner, now: () => now })
+  const tool = registered[0] as { execute(args: Record<string, unknown>): Promise<Record<string, unknown>> }
+
+  const created = await tool.execute({
+    action: 'create', name: 'once-tool', prompt: 'p', run_at: new Date(now + 60_000).toISOString(),
+  }) as { job?: { schedule?: { cron?: string; next_run_at?: string } } }
+  check('tool create with run_at summarizes a one-shot (no empty cron)',
+    created.job?.schedule?.cron === undefined
+    && created.job?.schedule?.next_run_at === new Date(now + 60_000).toISOString(),
+  JSON.stringify(created.job?.schedule))
+  const onceRow = (await s.load())[0]
+  check('tool one-shot row: enabled, blank cron, nextRunAt', onceRow?.schedule?.enabled === true
+    && onceRow?.schedule?.cron === '' && onceRow?.schedule?.nextRunAt === now + 60_000)
+  const badRunAt = await tool.execute({ action: 'create', prompt: 'p', run_at: 'garbage' }) as { error?: string }
+  check('tool create with invalid run_at rejected', typeof badRunAt.error === 'string')
+  const noSchedule = await tool.execute({ action: 'create', prompt: 'p' }) as { error?: string }
+  check('tool create without cron/interval/run_at rejected', typeof noSchedule.error === 'string')
+
+  // next_run_at pin: one-shot accepts (ms epoch digit string parses too),
+  // cron job refuses.
+  const onceId = onceRow!.id
+  await tool.execute({ action: 'update', job_id: onceId, next_run_at: String(now + 120_000) })
+  check('tool update next_run_at pins a one-shot', (await s.load()).find(j => j.id === onceId)?.schedule?.nextRunAt === now + 120_000)
+  await tool.execute({ action: 'create', name: 'cron-tool', prompt: 'p', schedule: '0 9 * * *' })
+  const cronId = (await s.load()).find(j => j.schedule?.cron === '0 9 * * *')!.id
+  const refused = await tool.execute({ action: 'update', job_id: cronId, next_run_at: String(now + 999_000) }) as { error?: string }
+  check('tool update next_run_at on a cron job rejected', typeof refused.error === 'string'
+    && (await s.load()).find(j => j.id === cronId)?.schedule?.nextRunAt === nextRunAtMs('0 9 * * *', now))
+
+  // pause keeps the instant; resume passes a one-shot's own instant through —
+  // even when past (the pending shot fires on the next tick).
+  await tool.execute({ action: 'update', job_id: onceId, next_run_at: String(now - 5_000) })
+  await tool.execute({ action: 'pause', job_id: onceId })
+  const pausedRow = (await s.load()).find(j => j.id === onceId)
+  check('tool pause keeps nextRunAt', pausedRow?.schedule?.enabled === false
+    && pausedRow?.schedule?.nextRunAt === now - 5_000)
+  await tool.execute({ action: 'resume', job_id: onceId })
+  const resumedRow = (await s.load()).find(j => j.id === onceId)
+  check('tool resume passes the one-shot instant through (even past)',
+    resumedRow?.schedule?.enabled === true && resumedRow?.schedule?.nextRunAt === now - 5_000)
+
+  disposer()
 }
 
 // ============================================================================

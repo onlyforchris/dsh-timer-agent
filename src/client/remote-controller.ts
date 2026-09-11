@@ -12,7 +12,7 @@
 import type {
   ControllerSnapshot, SessionsControllerFace,
 } from '../core/controller.ts'
-import type { JobRecord, NewJobInput, SessionTarget } from '../core/jobs.ts'
+import type { JobModelSelection, JobRecord, NewJobInput, SessionTarget } from '../core/jobs.ts'
 
 /** The sessions navigation face (ctx.sessions.open for transcript jumps). */
 export type { SessionsControllerFace }
@@ -104,32 +104,46 @@ export class RemoteBoardController {
   async createJob(input: NewJobInput): Promise<JobRecord | undefined> {
     const title = input.title.trim()
     if (title === '') return undefined
-    const cron = this.pendingCreateCron
+    const schedule = this.pendingCreateSchedule
     const response = await this.fetchJson('POST', '/api/dsh-timer-agent/jobs', {
       title,
       description: input.description,
       prompt: input.prompt,
       target: input.target,
+      ...input.kind !== 'command' && input.preset !== undefined && input.preset.trim() !== ''
+        ? { preset: input.preset }
+        : {},
       ...input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection },
-      ...(cron !== undefined ? { cron } : {}),
+      ...(schedule?.cron !== undefined ? { cron: schedule.cron } : {}),
+      ...(schedule?.intervalMinutes !== undefined ? { intervalMinutes: schedule.intervalMinutes } : {}),
+      // One-shot: no cron / interval staged, a runAt arms the host's nextRunAt.
+      ...(input.runAt !== undefined ? { runAt: input.runAt } : {}),
+      ...(input.kind === 'command'
+        ? { kind: 'command', command: input.command ?? '', args: input.args ?? '' }
+        : {}),
     })
     if (response === undefined || response.error !== undefined) return undefined
     await this.refresh()
     const created = (response.job as JobRecord | undefined) ?? this.jobs[this.jobs.length - 1]
-    this.pendingCreateCron = undefined
+    this.pendingCreateSchedule = undefined
     return created
   }
 
-  /** Cron to arm on the next create (the modal stages it; the API takes it at create). */
-  private pendingCreateCron: string | undefined
+  /** Schedule to arm on the next create (the modal stages it; the API takes it at create). */
+  private pendingCreateSchedule: { cron?: string; intervalMinutes?: number } | undefined
 
-  /** Stage a cron for the next createJob call (NewJobModal's schedule field). */
-  stageCreateCron(cron: string | undefined): void {
-    this.pendingCreateCron = cron
+  /** Stage a cron/fixed-interval schedule for the next createJob call (NewJobModal's schedule field). */
+  stageCreateSchedule(schedule: { cron?: string; intervalMinutes?: number } | undefined): void {
+    this.pendingCreateSchedule = schedule
   }
 
-  async updateJob(id: string, patch: Partial<Pick<JobRecord, 'title' | 'description' | 'prompt'>> & { target?: SessionTarget; cron?: string; scheduleEnabled?: boolean }): Promise<void> {
-    await this.fetchJson('PATCH', `/api/dsh-timer-agent/jobs?id=${encodeURIComponent(id)}`, patch)
+  async updateJob(id: string, patch: Partial<Pick<JobRecord, 'title' | 'description' | 'prompt' | 'command' | 'args' | 'preset'>> & { target?: SessionTarget; cron?: string; intervalMinutes?: number; nextRunAt?: number; scheduleEnabled?: boolean; timeoutMinutes?: number; modelSelection?: JobModelSelection | null }): Promise<void> {
+    const body: Record<string, unknown> = { ...patch }
+    if (patch.timeoutMinutes !== undefined) body.timeoutMinutes = patch.timeoutMinutes
+    // modelSelection: object pins a model, null clears it (host deletes the
+    // field); omitting it leaves the stored selection untouched.
+    if (patch.modelSelection === undefined) delete body.modelSelection
+    await this.fetchJson('PATCH', `/api/dsh-timer-agent/jobs?id=${encodeURIComponent(id)}`, body)
     await this.refresh()
   }
 
@@ -154,11 +168,19 @@ export class RemoteBoardController {
     await this.refresh()
   }
 
-  async setSchedule(id: string, patch: { enabled?: boolean; cron?: string }): Promise<boolean> {
+  async setSchedule(id: string, patch: { enabled?: boolean; cron?: string; intervalMinutes?: number }): Promise<boolean> {
     const body: Record<string, unknown> = {}
     if (patch.cron !== undefined) body.cron = patch.cron
+    if (patch.intervalMinutes !== undefined) body.intervalMinutes = patch.intervalMinutes
     if (patch.enabled !== undefined) body.scheduleEnabled = patch.enabled
     const response = await this.fetchJson('PATCH', `/api/dsh-timer-agent/jobs?id=${encodeURIComponent(id)}`, body)
+    await this.refresh()
+    return response !== undefined && response.error === undefined
+  }
+
+  /** Skip the next scheduled fire (host rolls nextRunAt one occurrence). */
+  async skipNextRun(id: string): Promise<boolean> {
+    const response = await this.fetchJson('PATCH', `/api/dsh-timer-agent/jobs?id=${encodeURIComponent(id)}`, { skipNext: true })
     await this.refresh()
     return response !== undefined && response.error === undefined
   }
@@ -166,12 +188,39 @@ export class RemoteBoardController {
   /** Host-owned now; kept for interface parity. */
   async applyScheduleNextRun(): Promise<void> {}
 
-  /** Jump to an execution's session transcript (leave the timer board first). */
+  /** Jump to an execution's session transcript. */
   openSession(sessionId: string): void {
-    this.selectedJobId = undefined
-    this.boardOpen = false
-    this.notify()
-    this.sessions.open(sessionId)
+    // The board overlays the conversation pane (single-occupant center
+    // column): opening a session while the board stays active looks like
+    // "nothing happened". Hand the column back FIRST, then navigate.
+    this.closeJob()
+    this.closeBoard()
+    // A scheduled run's session is created headlessly and may not be in the
+    // browser's list mirror yet — sessions.open() throws on unknown ids, so
+    // refresh the list when the face offers it, and never let a navigation
+    // failure escape into the click handler.
+    const open = (): void => {
+      try {
+        this.sessions.open(sessionId)
+      } catch (error) {
+        console.warn('[dsh-timer-agent] open session failed:', sessionId, error)
+      }
+    }
+    const refresh = this.sessions.refresh
+    if (refresh === undefined) {
+      open()
+      return
+    }
+    // Call the face's refresh WITHOUT redelivery of `this`: the adapter's
+    // closure is already bound to the concrete service, while the service's
+    // own refresh is a prototype method whose `this` must be the service —
+    // refresh.call(this.sessions) crashes with "Cannot read properties of
+    // undefined (reading 'manager')" and the open() below never runs.
+    try {
+      void Promise.resolve(refresh()).then(open, open)
+    } catch {
+      open()
+    }
   }
 
   /** Fire now (host runs it in the background). */

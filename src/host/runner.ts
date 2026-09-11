@@ -1,9 +1,12 @@
 /**
  * Host runner: the hermes-cron-shaped engine.
  *
- * - `tick()` (60s interval, the dsh web host process's lifetime): due jobs
- *   fire, schedule rolled forward BEFORE execution (at-most-once), skipped
- *   when the job is already running.
+ * - `tick()` (60s interval, the dsh web host process's lifetime): execution
+ *   is driven ENTIRELY by the persisted `nextRunAt` (cron/interval only
+ *   compute it). Due recurring jobs roll `nextRunAt` forward BEFORE the run
+ *   is accepted (at-most-once, with a race guard against hand-pinned
+ *   instants); due one-shot jobs consume `nextRunAt` inside requestRun's
+ *   atomic mutate. All fires are skipped while the job is already running.
  * - Execution: pinned sessionId → `agents.resume` (context continuity);
  *   otherwise `agents.create` in the target workdir (default workspace when
  *   blank) — a fresh session per run, attached to the workspace record so
@@ -13,15 +16,17 @@
  *   execution success/failed).
  */
 import { randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import type {
   HostAgent, HostAgentHandle, HostAgentRegistry, HostPluginContext,
   HostSession, HostSessionEvent, HostUserMessage, HostWorkspaceRegistry,
 } from './contracts.ts'
 import { isTurnEndEvent, turnErrorDetail } from './contracts.ts'
 import type { HostJobStore } from './store.ts'
-import { nextRunAtMs } from '../core/schedule.ts'
+import { isIntervalRule, isOneShotRule, isSchedulable, nextRunAtMs, scheduleNextMs } from '../core/schedule.ts'
+import { appendCapped, splitCommandArgs, truncateOutputTail } from '../core/command.ts'
 import {
-  settleExecution, startExecution, withSchedule,
+  settleExecution, startExecution, withSchedule, jobKind,
   type ExecutionRecord, type JobRecord,
 } from '../core/jobs.ts'
 
@@ -31,56 +36,22 @@ export interface RunnerDeps {
   store: HostJobStore
   /** Clock; injectable for tests. */
   now?: () => number
-  /**
-   * Fallback cwd when a job's target.workdir is blank and no session is pinned.
-   * Empty string keeps upstream behavior (deployment default workspace).
-   */
-  defaultWorkdir?: string
 }
 
-/**
- * Slug a job title into a session-id-safe prefix.
- * ASCII only: DSH puts the session id into `x-deepseek-harness-session-id`,
- * and fetch rejects non-ByteString header values (Chinese titles → TRANSPORT).
- */
+/** Slug a job title into a session-id-safe prefix (hermes names its cron sessions the same way). */
 function slug(title: string): string {
-  const base = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  const base = title.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-').replace(/^-+|-+$/g, '')
   return base === '' ? 'job' : base.slice(0, 32)
 }
 
 /** Safely read a selection off the default-model service (undefined on throw). */
-function trySelection(defaults: {
-  currentSelection(): { provider: string, model: string, reasoningEffort?: string }
-}): { provider: string, model: string, reasoningEffort?: string } | undefined {
+function trySelection(defaults: { currentSelection(): { provider: string, model: string } }): { provider: string, model: string } | undefined {
   try {
     const selection = defaults.currentSelection()
     if (selection.provider === '' || selection.model === '') return undefined
-    return {
-      provider: selection.provider,
-      model: selection.model,
-      ...selection.reasoningEffort === undefined || selection.reasoningEffort === ''
-        ? {}
-        : { reasoningEffort: selection.reasoningEffort },
-    }
+    return selection
   } catch {
     return undefined
-  }
-}
-
-/** Build agentOptions for create/resume, preserving reasoning effort from defaults. */
-function resolveAgentOptions(
-  jobSelection: { provider: string, model: string, reasoningEffort?: string } | undefined,
-  defaults: { currentSelection(): { provider: string, model: string, reasoningEffort?: string } } | undefined,
-): { provider: string, model: string, reasoningEffort?: string } | undefined {
-  const fallback = defaults === undefined ? undefined : trySelection(defaults)
-  const seed = jobSelection ?? fallback
-  if (seed === undefined) return undefined
-  const effort = seed.reasoningEffort
-    ?? (jobSelection !== undefined ? fallback?.reasoningEffort : undefined)
-  return {
-    provider: seed.provider,
-    model: seed.model,
-    ...effort === undefined || effort === '' ? {} : { reasoningEffort: effort },
   }
 }
 
@@ -103,6 +74,23 @@ interface InFlight {
   messageId: string
   /** Whether the session log consumed our message yet. */
   consumed: boolean
+  /** The live agent (for timeout cancellation). */
+  agent: HostAgent | undefined
+  /** Configured limit (ms) when the job carries a timeout; absent = unlimited. */
+  timeoutMs: number | undefined
+  /** Deadline (ms epoch) when the job carries a timeoutMs; absent = unlimited. */
+  timeoutAt: number | undefined
+}
+
+/** One in-flight COMMAND execution (no session; kill() cancels the process). */
+interface CommandFlight {
+  jobId: string
+  /** Configured limit (ms) when the job carries a timeout; absent = unlimited. */
+  timeoutMs: number | undefined
+  /** Deadline (ms epoch) when the job carries a timeoutMs; absent = unlimited. */
+  timeoutAt: number | undefined
+  /** Best-effort process cancellation (spawn failure tolerated). */
+  kill(): void
 }
 
 /**
@@ -113,8 +101,8 @@ export class TimerRunner {
   private readonly ctx: HostPluginContext
   private readonly store: HostJobStore
   private readonly now: () => number
-  private readonly defaultWorkdir: string
   private readonly inFlight = new Map<string, InFlight>() // by messageId
+  private readonly commandFlights = new Map<string, CommandFlight>() // by executionId
   private timer: ReturnType<typeof setInterval> | undefined
   private requestTimer: ReturnType<typeof setInterval> | undefined
   private disposed = false
@@ -125,14 +113,6 @@ export class TimerRunner {
     this.ctx = deps.ctx
     this.store = deps.store
     this.now = deps.now ?? (() => Date.now())
-    this.defaultWorkdir = (deps.defaultWorkdir ?? '').trim()
-  }
-
-  /** Effective workdir for a new-session run: job override, else plugin default. */
-  private resolveWorkdir(job: JobRecord): string {
-    const fromJob = job.target.workdir.trim()
-    if (fromJob !== '') return fromJob
-    return this.defaultWorkdir
   }
 
   /** Start the ticker + the session-event watcher. */
@@ -158,14 +138,51 @@ export class TimerRunner {
   /** Fire pending manual-run requests only (the 5s fast path). */
   private async pollRequests(): Promise<void> {
     if (this.disposed) return
+    await this.checkTimeouts()
     const jobs = await this.store.load()
     if (!jobs.some(job => job.runRequestedAt !== undefined)) return
     await this.tick()
   }
 
+  /**
+   * Enforce per-job run timeouts (n8n / cron-job.org parity, and the
+   * stuck-run risk hermes #121953-class issues describe): an execution
+   * still in flight past its deadline is cancelled and settled failed.
+   * At-most-once: the flight is removed BEFORE settle, so a late turn/end
+   * cannot double-settle.
+   */
+  private async checkTimeouts(): Promise<void> {
+    for (const flight of [...this.inFlight.values()]) {
+      if (flight.timeoutAt === undefined || this.now() < flight.timeoutAt) continue
+      this.inFlight.delete(flight.messageId)
+      try {
+        flight.agent?.cancel('dsh-timer-agent: run timed out')
+      } catch (error) {
+        console.warn('[dsh-timer-agent] timeout cancel failed:', error)
+      }
+      const seconds = flight.timeoutMs === undefined ? 0 : Math.max(1, Math.round(flight.timeoutMs / 1000))
+      void this.settle(flight.jobId, flight.executionId, 'failed', `run timed out after ${seconds}s (deadline reached)`)
+    }
+    for (const [executionId, flight] of [...this.commandFlights.entries()]) {
+      if (flight.timeoutAt === undefined || this.now() < flight.timeoutAt) continue
+      this.commandFlights.delete(executionId)
+      try {
+        flight.kill()
+      } catch (error) {
+        console.warn('[dsh-timer-agent] command timeout kill failed:', error)
+      }
+      const seconds = flight.timeoutMs === undefined ? 0 : Math.max(1, Math.round(flight.timeoutMs / 1000))
+      void this.settle(flight.jobId, executionId, 'failed', `command timed out after ${seconds}s (killed)`)
+    }
+  }
+
   async dispose(): Promise<void> {
     this.disposed = true
     this.stop()
+    for (const flight of this.commandFlights.values()) {
+      try { flight.kill() } catch { /* best effort */ }
+    }
+    this.commandFlights.clear()
     for (const handle of this.pinnedHandles.values()) {
       await handle.dispose().catch(() => undefined)
     }
@@ -174,31 +191,66 @@ export class TimerRunner {
 
   /**
    * One scheduler pass: fire due schedules, then manual run requests.
-   * (at-most-once: `nextRunAt` rolls forward before the run is accepted.)
+   * Recurring jobs roll `nextRunAt` forward before the run is accepted
+   * (at-most-once); one-shot jobs consume it inside requestRun's atomic
+   * mutate instead (see {@link requestRun}).
    */
   async tick(): Promise<number> {
     if (this.disposed) return 0
+    await this.checkTimeouts()
     const jobs = await this.store.load()
     let fired = 0
     for (const job of jobs) {
-      // 1. due schedule (archived jobs never fire)
+      // 1. due schedule (archived jobs never fire; cron, interval, or one-shot)
       const schedule = job.schedule
       if (job.status !== 'archived'
-        && schedule !== undefined && schedule.enabled && schedule.nextRunAt !== undefined && schedule.nextRunAt <= this.now()) {
-        const next = nextRunAtMs(schedule.cron, schedule.nextRunAt)
-        if (await this.requestRun(job.id)) {
-          fired += 1
-          await this.store.mutate(current => {
-            const row = current.find(candidate => candidate.id === job.id)
-            if (row === undefined || row.schedule === undefined) return undefined
-            return {
-              jobs: current.map(candidate =>
-                candidate.id === job.id
-                  ? withSchedule(candidate, { nextRunAt: next, lastTriggeredAt: this.now() }, this.now())
-                  : candidate),
-              result: true,
-            }
-          })
+        && schedule !== undefined && schedule.enabled && isSchedulable(schedule)
+        && schedule.nextRunAt !== undefined && schedule.nextRunAt <= this.now()) {
+        const firedAt = schedule.nextRunAt
+        if (isOneShotRule(schedule)) {
+          // One-shot: there is no "next" instant to compute — the fire IS the
+          // consumption. requestRun clears nextRunAt in its atomic mutate, so
+          // a skipped (already running) fire leaves the shot armed and the
+          // next tick retries — same skip-while-running semantics as recurring.
+          if (await this.requestRun(job.id)) fired += 1
+        } else {
+          // Interval grids advance from the just-fired instant; cron follows
+          // its own grid (max(firedAt, nextRunAt) base keeps a skipped-running
+          // occurrence from rolling the grid backwards).
+          const next = isIntervalRule(schedule)
+            ? scheduleNextMs(schedule, firedAt)
+            : nextRunAtMs(schedule.cron, firedAt)
+          if (await this.requestRun(job.id)) {
+            fired += 1
+            await this.store.mutate(current => {
+              const row = current.find(candidate => candidate.id === job.id)
+              if (row === undefined || row.schedule === undefined) return undefined
+              // Race guard: the user may have hand-pinned nextRunAt between
+              // the snapshot above and this mutate — only roll the grid when
+              // the row still carries a pipeline-owned instant, i.e. the one
+              // that fired, or the interval re-anchor requestRun just wrote
+              // (identifiable as `latest execution startedAt + N`, immune to
+              // real-clock drift between the two mutates). Anything else is a
+              // user pin: keep it, stamp only the trigger.
+              const schedule = row.schedule
+              const lastStartedAt = row.executions[row.executions.length - 1]?.startedAt
+              const reanchored = isIntervalRule(schedule)
+                && schedule.nextRunAt !== undefined && lastStartedAt !== undefined
+                && schedule.nextRunAt === lastStartedAt + schedule.intervalMinutes! * 60_000
+              const rolled = schedule.nextRunAt === firedAt || reanchored
+              return {
+                jobs: current.map(candidate =>
+                  candidate.id === job.id
+                    ? withSchedule(
+                        candidate,
+                        { ...(rolled ? { nextRunAt: next } : {}), lastTriggeredAt: this.now() },
+                        this.now(),
+                      )
+                    : candidate),
+                result: true,
+              }
+            })
+          }
         }
       }
       // 2. manual run request (from the tool or the web UI)
@@ -227,11 +279,33 @@ export class TimerRunner {
     const outcome = await this.store.mutate(current => {
       const job = current.find(candidate => candidate.id === jobId)
       if (job === undefined || job.status === 'running' || job.status === 'archived') return undefined
-      const targeting = job.target.sessionId !== '' ? 'specified-session' : 'new-session'
-      const { job: next, execution } = startExecution(job, this.now(), randomUUID(), targeting)
-      if (extraPrompt !== undefined && extraPrompt.trim() !== '') {
+      const kind = jobKind(job)
+      const targeting: ExecutionRecord['targeting'] = kind === 'command'
+        ? 'command'
+        : job.target.sessionId !== '' ? 'specified-session' : 'new-session'
+      const { job: openedJob, execution } = startExecution(job, this.now(), randomUUID(), targeting)
+      let next = openedJob
+      if (kind === 'agent' && extraPrompt !== undefined && extraPrompt.trim() !== '') {
         execution.error = undefined
         next.prompt = `${next.prompt}\n\n## Run Context\n${extraPrompt}`.trim()
+      }
+      // One-shot consumption, in the SAME atomic mutate that opens the run
+      // (at-most-once): scheduled fires, manual runs, success, and failure all
+      // spend the single shot (settleExecution archives the job afterwards),
+      // while a rejected run (already running) leaves it armed for a retry.
+      if (next.schedule !== undefined && isOneShotRule(next.schedule) && next.schedule.nextRunAt !== undefined) {
+        next = withSchedule(next, { nextRunAt: undefined, lastTriggeredAt: this.now() }, this.now())
+      }
+      // A manual run counts as the last execution: an armed interval grid
+      // re-anchors on it (下次 = 手动时刻 + N). Scheduled fires re-roll the
+      // grid right after (tick branch 1), so this never shifts cron/interval
+      // grids that fire on their own.
+      if (next.schedule?.enabled === true && isIntervalRule(next.schedule)) {
+        next = withSchedule(
+          next,
+          { nextRunAt: this.now() + next.schedule.intervalMinutes! * 60_000, lastTriggeredAt: this.now() },
+          this.now(),
+        )
       }
       return {
         jobs: current.map(candidate => (candidate.id === jobId ? next : candidate)),
@@ -243,8 +317,12 @@ export class TimerRunner {
     return true
   }
 
-  /** The real execution: connect/create the agent, send the prompt. */
+  /** The real execution: command jobs spawn directly; agent jobs connect/create the agent and send the prompt. */
   private async execute(job: JobRecord, execution: ExecutionRecord): Promise<void> {
+    if (jobKind(job) === 'command') {
+      this.executeCommand(job, execution)
+      return
+    }
     try {
       const handle = await this.connectAgent(job)
       const agent: HostAgent = handle.agent
@@ -261,10 +339,82 @@ export class TimerRunner {
         sessionId: agent.session.id,
         messageId: message.id,
         consumed: false,
+        agent,
+        timeoutMs: job.timeoutMs,
+        timeoutAt: job.timeoutMs !== undefined && job.timeoutMs > 0
+          ? this.now() + job.timeoutMs
+          : undefined,
       })
       agent.followup(message)
     } catch (error) {
       await this.settle(job.id, execution.id, 'failed', error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  /**
+   * Command execution (普通任务): spawn the job's command + args directly —
+   * no AI, no session, no API quota. Exit 0 settles succeeded; anything else
+   * (nonzero exit, spawn failure, timeout kill) settles failed with the
+   * captured stdout/stderr tail attached to the execution record.
+   */
+  private executeCommand(job: JobRecord, execution: ExecutionRecord): void {
+    const command = (job.command ?? '').trim()
+    if (command === '') {
+      void this.settle(job.id, execution.id, 'failed', 'command is empty (edit the job and set a command)')
+      return
+    }
+    let argv: string[]
+    try {
+      argv = [command, ...splitCommandArgs(job.args ?? '')]
+    } catch (error) {
+      void this.settle(job.id, execution.id, 'failed', error instanceof Error ? error.message : String(error))
+      return
+    }
+    let stdout = ''
+    let stderr = ''
+    let child: { kill(): void } | undefined
+    try {
+      const spawned = spawn(argv[0], argv.slice(1), {
+        cwd: job.target.workdir.trim() !== '' ? job.target.workdir.trim() : undefined,
+        env: process.env,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      child = spawned
+      spawned.stdout?.on('data', (chunk: Uint8Array) => { stdout = appendCapped(stdout, Buffer.from(chunk).toString('utf8')) })
+      spawned.stderr?.on('data', (chunk: Uint8Array) => { stderr = appendCapped(stderr, Buffer.from(chunk).toString('utf8')) })
+      const timeoutMs = job.timeoutMs !== undefined && job.timeoutMs > 0 ? job.timeoutMs : undefined
+      this.commandFlights.set(execution.id, {
+        jobId: job.id,
+        timeoutMs,
+        timeoutAt: timeoutMs !== undefined ? this.now() + timeoutMs : undefined,
+        kill: () => { try { spawned.kill() } catch { /* best effort */ } },
+      })
+      spawned.on('error', error => {
+        this.commandFlights.delete(execution.id)
+        void this.settle(job.id, execution.id, 'failed',
+          `failed to start command '${command}': ${error instanceof Error ? error.message : String(error)}`)
+      })
+      spawned.on('close', (code, signal) => {
+        this.commandFlights.delete(execution.id)
+        const output = truncateOutputTail(stdout === '' && stderr === '' ? '' : `${stdout}${stderr === '' ? '' : `\n[stderr]\n${stderr}`}`)
+        // A kill from the timeout path already settled this execution
+        // (settle is idempotent); a spontaneous close settles here.
+        if (signal !== null && signal !== undefined) {
+          void this.settle(job.id, execution.id, 'failed', `command killed by signal ${signal}`, { output })
+          return
+        }
+        if (code === 0) {
+          void this.settle(job.id, execution.id, 'succeeded', undefined, { exitCode: 0, output })
+          return
+        }
+        void this.settle(job.id, execution.id, 'failed',
+          code === null ? 'command exited without an exit code' : `command exited with code ${code}`,
+          { exitCode: code ?? undefined, output })
+      })
+    } catch (error) {
+      if (child !== undefined) this.commandFlights.delete(execution.id)
+      void this.settle(job.id, execution.id, 'failed', error instanceof Error ? error.message : String(error))
     }
   }
 
@@ -299,10 +449,7 @@ export class TimerRunner {
         // without one the resume keeps the session's persisted selection.
         const handle = await agents.resume({
           resumeSessionId: pinnedId,
-          ...(() => {
-            const options = resolveAgentOptions(job.modelSelection, this.ctx.get('agentDefaultModel'))
-            return options === undefined ? {} : { agentOptions: options }
-          })(),
+          ...job.modelSelection === undefined ? {} : { agentOptions: { ...job.modelSelection } },
           ...resumeSetup === undefined ? {} : { setup: resumeSetup },
         })
         this.pinnedHandles.set(pinnedId, handle)
@@ -325,43 +472,61 @@ export class TimerRunner {
     // work starts. Resolution order: the job's own model selection, else the
     // deployment agentDefaultModel (mirroring the GUI/headless entry points).
     const defaults = this.ctx.get('agentDefaultModel')
-    const agentOptions = resolveAgentOptions(job.modelSelection, defaults)
-    // Join the deployment's default agent preset: without it the new session
-    // runs on the empty global layer — no tool packages, no preset prompt
-    // sections. A broken default preset fails the run loudly (creation rolls
-    // back with the resolver's error), matching the GUI's behavior.
+    let agentOptions: { provider?: string, model?: string, reasoningEffort?: string } | undefined
+    const seed = job.modelSelection ?? (defaults === undefined ? undefined : trySelection(defaults))
+    if (seed !== undefined) {
+      agentOptions = { provider: seed.provider, model: seed.model }
+    }
+    // Join the deployment's agent preset: without it the new session runs
+    // on the empty global layer — no tool packages, no preset prompt
+    // sections. The job's own preset id (agent jobs targeting new sessions)
+    // wins; otherwise the roster default. A broken default preset fails the
+    // run loudly (creation rolls back with the resolver's error), matching
+    // the GUI's behavior; a job-pinned id the roster no longer supplies
+    // degrades to the default with a warning instead of failing forever.
     let presetMeta: { agentPreset: string } | undefined
     let presetSetup: ((agentCtx: object) => Promise<void>) | undefined
-    ;({ presetMeta, presetSetup } = await this.composeDefaultPreset())
-    const workdir = this.resolveWorkdir(job)
+    ;({ presetMeta, presetSetup } = await this.composePreset(job.preset))
     const handle = await agents.create({
       sessionId,
       ...(agentOptions !== undefined ? { agentOptions } : {}),
-      ...(workdir !== ''
-        ? { meta: { cwd: workdir, ...presetMeta } }
+      ...(job.target.workdir !== ''
+        ? { meta: { cwd: job.target.workdir, ...presetMeta } }
         : presetMeta === undefined ? {} : { meta: presetMeta }),
       ...(presetSetup === undefined ? {} : { setup: presetSetup }),
     })
-    await this.attachWorkspace(sessionId, workdir).catch(() => undefined)
+    await this.attachWorkspace(sessionId, job.target.workdir).catch(() => undefined)
     return handle
   }
 
   /**
-   * Compose a NEW session's default preset: resolve the roster default, record
-   * it on the session header, and join the agent's scope to its standing
-   * mount inside the factory setup hook (api-proxy composeAgent precedent —
-   * the join decides the agent's tools, prompt sections, and skills, so a
-   * session created bare resolves them against the empty global layer).
-   * Undefined parts when no roster is composed; a broken default preset
-   * rejects so creation rolls back with the resolver's error.
+   * Compose a NEW session's preset: resolve the wanted id (or the roster
+   * default when blank), record it on the session header, and join the
+   * agent's scope to its standing mount inside the factory setup hook
+   * (api-proxy composeAgent precedent — the join decides the agent's tools,
+   * prompt sections, and skills, so a session created bare resolves them
+   * against the empty global layer). Undefined parts when no roster is
+   * composed; a broken preset rejects so creation rolls back with the
+   * resolver's error — except a job-pinned id the roster no longer knows,
+   * which degrades to the default (warned) rather than failing every run.
    */
-  private async composeDefaultPreset(): Promise<{
+  private async composePreset(wanted?: string): Promise<{
     presetMeta: { agentPreset: string } | undefined
     presetSetup: ((agentCtx: object) => Promise<void>) | undefined
   }> {
     const presets = this.ctx.get('agentPresets')
     if (presets === undefined) return { presetMeta: undefined, presetSetup: undefined }
-    const resolvedId = (await presets.resolve()).id
+    let resolvedId: string
+    if (wanted !== undefined && wanted.trim() !== '') {
+      try {
+        resolvedId = (await presets.resolve(wanted)).id
+      } catch (error) {
+        console.warn(`[dsh-timer-agent] job preset "${wanted}" is not on the roster; falling back to the default:`, error)
+        resolvedId = (await presets.resolve()).id
+      }
+    } else {
+      resolvedId = (await presets.resolve()).id
+    }
     return {
       presetMeta: { agentPreset: resolvedId },
       presetSetup: async agentCtx => { await presets.mount(agentCtx, resolvedId) },
@@ -427,13 +592,13 @@ export class TimerRunner {
   }
 
   /** Persist a settled (or failed-to-start) execution and job status. */
-  private async settle(jobId: string, executionId: string, outcome: 'succeeded' | 'failed' | 'cancelled', error?: string): Promise<void> {
+  private async settle(jobId: string, executionId: string, outcome: 'succeeded' | 'failed' | 'cancelled', error?: string, extra?: { exitCode?: number, output?: string }): Promise<void> {
     await this.store.mutate(current => {
       const job = current.find(candidate => candidate.id === jobId)
       if (job === undefined) return undefined
       return {
         jobs: current.map(candidate =>
-          candidate.id === jobId ? settleExecution(candidate, executionId, outcome, this.now(), error) : candidate),
+          candidate.id === jobId ? settleExecution(candidate, executionId, outcome, this.now(), error, extra) : candidate),
         result: true,
       }
     })

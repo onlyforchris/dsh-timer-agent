@@ -62,6 +62,104 @@ export function isValidCron(expr: string): boolean {
 }
 
 /**
+ * Whether the rule runs on a fixed interval ("every N minutes from the last
+ * trigger") instead of a cron grid — cron cannot express e.g. every 302
+ * minutes, and manual runs need to re-anchor a live grid.
+ */
+export function isIntervalRule(
+  rule: { cron?: string; intervalMinutes?: number } | undefined | null,
+): boolean {
+  return rule !== null && rule !== undefined &&
+    typeof rule.intervalMinutes === 'number' && rule.intervalMinutes > 0
+}
+
+/**
+ * Whether an enabled rule can fire at all: a cron expression, a fixed
+ * interval, or an explicit `nextRunAt` (the one-shot shape — no recurrence
+ * expression, the persisted instant is the whole schedule). The existing
+ * "no cron + no interval" shape still returns false so legacy blank rules
+ * stay unschedulable.
+ */
+export function isSchedulable(
+  rule: { cron?: string; intervalMinutes?: number; nextRunAt?: number } | undefined | null,
+): boolean {
+  return rule !== null && rule !== undefined &&
+    ((rule.cron ?? '') !== '' || isIntervalRule(rule) || rule.nextRunAt !== undefined)
+}
+
+/**
+ * Whether the rule has no recurrence expression at all (blank cron, no
+ * interval) — i.e. it is a one-shot: the persisted `nextRunAt` is its only
+ * scheduling basis and it is consumed by the next execution, however that
+ * execution ends. Whether `nextRunAt` is actually set does not matter here;
+ * callers decide how to treat a one-shot without one.
+ */
+export function isOneShotRule(rule: { cron?: string; intervalMinutes?: number } | undefined | null): boolean {
+  return !isIntervalRule(rule) && (rule?.cron ?? '') === ''
+}
+
+/**
+ * Next due instant when a paused/missed rule resumes, anchored on the REAL
+ * last execution: `baseMs` is the latest execution's startedAt (callers fall
+ * back to lastTriggeredAt / createdAt before calling). Missed slots are NOT
+ * replayed — the result is always strictly in the future relative to `nowMs`
+ * (except a one-shot, which is passed through untouched: the caller owns the
+ * keep-or-skip decision for a past one-shot instant).
+ *
+ * - interval: grid math via {@link intervalNextMs} (whole-interval stacking,
+ *   no drift; a missing base degenerates to `nowMs + N`).
+ * - cron: normally the next grid match after `baseMs`; when that lies in the
+ *   past (or the expression fails to parse), it skips ahead to the next match
+ *   after `nowMs`.
+ * - one-shot: `rule.nextRunAt` verbatim (possibly in the past).
+ *
+ * @returns undefined only when the cron expression is invalid on both probes.
+ */
+export function resumeNextMs(
+  rule: { cron: string; intervalMinutes?: number; nextRunAt?: number },
+  baseMs: number | undefined,
+  nowMs: number,
+): number | undefined {
+  if (isIntervalRule(rule)) return intervalNextMs(baseMs, rule.intervalMinutes!, nowMs)
+  if (isOneShotRule(rule)) return rule.nextRunAt
+  const fromBase = nextRunAtMs(rule.cron, baseMs ?? nowMs)
+  if (fromBase !== undefined && fromBase > nowMs) return fromBase
+  // The base's next slot already passed (host down / paused too long): skip
+  // the missed occurrence, take the next one strictly after now.
+  return nextRunAtMs(rule.cron, nowMs)
+}
+
+/** Next run for the rule: interval → `fromMs + N minutes`; cron → next grid match. */
+export function scheduleNextMs(
+  rule: { cron: string; intervalMinutes?: number },
+  fromMs: number,
+): number | undefined {
+  if (isIntervalRule(rule)) return fromMs + rule.intervalMinutes! * 60_000
+  return nextRunAtMs(rule.cron, fromMs)
+}
+
+/**
+ * Next fixed-interval instant anchored on the last trigger: `anchorMs` plus
+ * the smallest whole number of intervals landing strictly after `fromMs`.
+ * A missed stretch (host down, job paused, long run) stacks whole intervals
+ * forward instead of re-anchoring at the current time, so the grid never
+ * drifts with restarts; without an anchor the first slot is `fromMs + N`.
+ */
+export function intervalNextMs(
+  anchorMs: number | undefined,
+  intervalMinutes: number,
+  fromMs: number,
+): number {
+  const step = intervalMinutes * 60_000
+  let next = (anchorMs ?? fromMs) + step
+  if (next <= fromMs) next += Math.ceil((fromMs - next) / step) * step
+  // fromMs landing exactly on a grid point gets one more step: the slot is
+  // strictly after it (the ported original returned fromMs itself there).
+  if (next <= fromMs) next += step
+  return next
+}
+
+/**
  * Compute the next matching instant after `fromMs` (ms epoch), in local
  * time, at minute granularity, strictly greater than `fromMs`.
  */

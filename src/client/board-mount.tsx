@@ -8,7 +8,7 @@
  */
 import { createRoot, type Root } from 'react-dom/client'
 import type { TargetGroup } from './target-options.ts'
-import { listModelOptions, type ModelOptions } from './target-options.ts'
+import { listModelOptions, listPresetOptions, type ModelOptions, type PresetOptions } from './target-options.ts'
 import type { BoardControllerFace } from './controller-face.ts'
 import { TimerBoard } from './board/TimerBoard.tsx'
 import css from './board.module.css'
@@ -16,11 +16,7 @@ import css from './board.module.css'
 /** The injected board container (kept in the DOM, hidden when inactive). */
 export const BOARD_VIEW_SELECTOR = '[data-dsh-timeragent-view]'
 
-/** Prefer data-pane (older shells); fall back to hashed centerCol class (0.1.1+). */
-const CONVERSATION_COLUMN_SELECTORS = [
-  '[data-pane="conversation"]',
-  '[class*="centerCol"]',
-] as const
+const CONVERSATION_COLUMN_SELECTOR = '[data-pane="conversation"]'
 const ACTIVE_ATTR = 'data-dsh-timeragent-active'
 /** Sibling panels' activation attributes, removed when this panel opens. */
 const OTHER_ACTIVE_ATTRS = ['data-dsh-ssh-active', 'data-dsh-taskboard-active']
@@ -30,9 +26,15 @@ const PANEL_NAME = 'timeragent'
 
 /** Find the center column, or undefined while the frame is not mounted. */
 function conversationColumn(): HTMLElement | undefined {
-  for (const selector of CONVERSATION_COLUMN_SELECTORS) {
-    const el = document.querySelector<HTMLElement>(selector)
-    if (el !== null) return el
+  // Try multiple selectors for different DSH versions/shells
+  const selectors = [
+    '[data-pane="conversation"]',
+    '[class*="centerCol"]',
+    '[class*="conversation"]:not([class*="sidebar"])',
+  ]
+  for (const sel of selectors) {
+    const el = document.querySelector<HTMLElement>(sel)
+    if (el) return el
   }
   return undefined
 }
@@ -49,6 +51,7 @@ export function mountBoard(controller: BoardControllerFace, targetOptions: () =>
   let root: Root | undefined
   let container: HTMLDivElement | undefined
   const modelOptions = (): Promise<ModelOptions> => listModelOptions()
+  const presetOptions = (): Promise<PresetOptions> => listPresetOptions()
 
   const ensure = (): void => {
     if (container !== undefined) return
@@ -59,7 +62,7 @@ export function mountBoard(controller: BoardControllerFace, targetOptions: () =>
     container.className = css.boardView
     column.appendChild(container)
     root = createRoot(container)
-    root.render(<TimerBoard controller={controller} targetOptions={targetOptions} modelOptions={modelOptions} />)
+    root.render(<TimerBoard controller={controller} targetOptions={targetOptions} modelOptions={modelOptions} presetOptions={presetOptions} />)
   }
 
   // The frame mounts after boot settlement; watch for the column's arrival.

@@ -12,6 +12,7 @@
  * plugin must not take the GUI down.
  */
 import { RemoteBoardController } from './remote-controller.ts'
+import { sessionsFaceOf, type SessionsServiceShape } from './sessions-face.ts'
 import { mountBoard } from './board-mount.tsx'
 import { mountSidebarEntry } from './sidebar-entry.ts'
 import { listTargetOptions } from './target-options.ts'
@@ -24,28 +25,26 @@ export const inject = ['slots', 'sessions']
  * @param ctx - client root context (services: sessions).
  */
 export function apply(ctx: unknown): void {
-  const sessions = ctx as {
-    list: { getSnapshot(): { current: string | undefined }; subscribe(fn: () => void): () => void }
-    open(id: string): void
-  }
+  // Resolve the sessions SERVICE once through the inject declaration. The
+  // ctx object is a Cordis proxy where only `inject` names resolve — reading
+  // service members (list/open/refresh) straight off it throws "cannot get
+  // property ... without inject", and an eager read at apply time fails the
+  // whole web boot. Everything downstream works on the plain service object.
+  const ctxTyped = ctx as { sessions?: SessionsServiceShape }
+  const sessions = ctxTyped.sessions
 
-  // Adapt the sessions service to SessionsControllerFace.
-  // The sessions.list is an ObservableSnapshot with getSnapshot/subscribe,
-  // and sessions.open opens a session by id.
-  const sessionsFace: import('../core/controller.js').SessionsControllerFace = {
-    list: {
-      getSnapshot: () => {
-        const snapshot = sessions.list.getSnapshot()
-        return { current: snapshot.current }
-      },
-      subscribe: (fn: () => void) => {
-        return sessions.list.subscribe(fn)
-      },
-    },
-    open: (id: string) => {
-      sessions.open(id)
-    },
-  }
+  // Fallback when sessions service is missing (e.g., when dsh-web plugin is removed)
+  const sessionsFace = sessions !== undefined
+    ? sessionsFaceOf(sessions)
+    : {
+        list: {
+          getSnapshot: () => ({ current: undefined }),
+          subscribe: () => () => {},
+        },
+        open: (_id: string) => {
+          console.warn('[dsh-timer-agent] sessions.open called but sessions service is unavailable')
+        },
+      }
 
   const controller = new RemoteBoardController(sessionsFace)
   controller.start()
@@ -53,7 +52,14 @@ export function apply(ctx: unknown): void {
   const disposers: Array<() => void> = []
   try {
     // Session-target dropdown data source: rebuilt on each modal open.
-    const targetOptions = (): ReturnType<typeof listTargetOptions> => listTargetOptions(ctx as never)
+    const targetOptions = (): ReturnType<typeof listTargetOptions> => {
+      try {
+        return listTargetOptions(ctx as never)
+      } catch (error) {
+        console.warn('[dsh-timer-agent] target-options failed, returning empty:', error)
+        return Promise.resolve([])
+      }
+    }
     disposers.push(mountSidebarEntry(controller))
     disposers.push(mountBoard(controller, targetOptions))
   } catch (error) {
@@ -61,14 +67,14 @@ export function apply(ctx: unknown): void {
     console.error('[dsh-timer-agent] mount failed:', error)
   }
 
-  ;(ctx as { effect(setup: () => () => void, key: string): unknown }).effect(() => {
-    // Cordis effect semantics: setup runs now and its RETURN VALUE is the
-    // registered teardown. Returning the disposer (not running it here) is
-    // the fix for the entry-vanishing bug: as a direct body it executed at
-    // apply time and tore the mounts down immediately after mounting them.
-    return () => {
-      for (const dispose of disposers.splice(0)) dispose()
-      controller.dispose()
-    }
-  }, 'dsh-timer-agent: unmount')
+  // Teardown: Cordis effect when available (client runtime), otherwise direct disposal.
+  const effectFn = (ctxTyped as { effect?(setup: () => () => void, key: string): unknown }).effect
+  if (typeof effectFn === 'function') {
+    effectFn(() => {
+      return () => {
+        for (const dispose of disposers.splice(0)) dispose()
+        controller.dispose()
+      }
+    }, 'dsh-timer-agent: unmount')
+  }
 }

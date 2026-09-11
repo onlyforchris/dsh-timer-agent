@@ -8,11 +8,6 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-// `ctx.settings` is an optional Cordis service: importing the module only for its
-// type augmentation. The runtime wiring goes through `ctx.inject(['settings'], …)`,
-// never through a named export — `installSettingsSection`/`settingsNamespace` were
-// removed in dsh-settings 0.1.2 and replaced by `settings.installSection`.
-import type {} from '@deepseek-ai/dsh-settings'
 import z from 'schemastery'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { HostPluginContext } from './host/contracts.ts'
@@ -24,16 +19,15 @@ import { makeRoutes } from './host/routes.ts'
 /** Order of the announcement section within the tool-guidance band. */
 const SECTION_ORDER = 201
 
-export const inject = ['webServer', 'tools', 'systemPrompt', 'agents']
+/** Plugin name: used for logs, diagnostics, and Fiber identity. */
+export const name = 'dsh-timer-agent'
+
+export const inject = ['webServer', 'tools', 'systemPrompt', 'agents', 'settings']
 
 /** Model-facing announcement: plugin presence, capabilities, and limits. */
-export const TIMER_AGENT_GUIDANCE = '本机已安装 dsh-timer-agent 插件（定时任务）：60 秒 ticker 在 dsh web 宿主进程常驻，GUI 关闭也会触发。台账在 ~/.dsh/timer-agent/jobs.json。支持 5 段 cron；可指定项目 workdir 或钉住会话；未指定 workdir 时默认跑在 IM 工作区（插件配置 defaultWorkdir）。到点通过真实 agent 会话执行自包含 prompt。可用 timer_agent 工具或侧边栏「定时任务」管理。执行消耗 API 额度；无人在场，prompt 不可提问。'
+export const TIMER_AGENT_GUIDANCE = '本机已安装 dsh-timer-agent 插件（DSH 定时任务引擎，host 常驻，参考 hermes-agent cron）：60 秒 ticker 在 dsh web 服务进程内常驻运行，dsh web 服务启动即生效（GUI 页面关闭也照常触发）。任务台账存于 ~/.dsh/timer-agent/jobs.json。任务分两类：kind=agent（默认，AI Agent 任务）到点通过真实 agent 会话执行 prompt；kind=command（普通任务）不经过 AI，直接 spawn command+args 执行脚本，不消耗 API 额度。任务支持 5 段 cron（如 0 9 * * *）；agent 任务可指定项目 workdir（任务会话在该目录运行并加载其 AGENTS.md）、可指定已有会话 session（每次触发继续该对话，具备上下文连续性）；两者都留空则每次触发在默认工作空间新建会话发起新对话；command 任务只需标题、命令、参数与定时器（workdir 作为进程工作目录，超时同样生效，退出码非 0 记为失败并保留输出尾部）。对话中可用 timer_agent 工具直接 create/list/update/pause/resume/remove/run 定时任务（create/update 支持 kind/command/args 参数）；Web GUI 侧边栏「定时任务」面板管理同一批任务。定时执行无人在场，agent 任务的 prompt 必须自包含、不可提问。用户提到「定时任务 / 定时器 / cron」时即指本插件，请据此协作。'
 
-/**
- * Settings namespace of the plugin's capability.
- * A lowercase-hyphenated identifier — dsh-settings validates the literal shape
- * at compile time and again at registration.
- */
+/** Settings namespace of the plugin's capability (lowercase hyphenated id). */
 export const TIMER_AGENT_SETTINGS_NAMESPACE = 'timer-agent'
 
 /** Plugin config, validated by the same-named schemastery schema. */
@@ -42,22 +36,15 @@ export interface Config {
   announceToAgent?: boolean
   /** Master switch for the plugin (ticker + tool + routes). */
   enabled?: boolean
-  /**
-   * Absolute path used when a job leaves workdir blank (new-session runs).
-   * Defaults to the DSH IM sandbox so timed jobs land with the right AGENTS.md.
-   */
-  defaultWorkdir?: string
 }
 
 export const Config: z<Config> = z.object({
   announceToAgent: z.boolean().default(true),
   enabled: z.boolean().default(true),
-  defaultWorkdir: z.string().default('D:\\DSH\\im-workspace'),
 })
 
 /** Schema default, re-read for hand-built test contexts. */
 const DEFAULT_ANNOUNCE = true
-const DEFAULT_WORKDIR = 'D:\\DSH\\im-workspace'
 
 /**
  * Mount the engine: ticker + runner, tool, routes, announcement.
@@ -79,11 +66,7 @@ export function apply(ctx: Context, config?: Config): void {
     if ((current().enabled ?? true) === false) return
 
     const store = new HostJobStore()
-    const runner = new TimerRunner({
-      ctx: host,
-      store,
-      defaultWorkdir: current().defaultWorkdir ?? DEFAULT_WORKDIR,
-    })
+    const runner = new TimerRunner({ ctx: host, store })
     runner.start()
 
     disposeTool = ctx.effect(() => registerTimerTool(ctx.tools!, {
@@ -117,17 +100,9 @@ export function apply(ctx: Context, config?: Config): void {
     }
   }
 
-  // `settings` is an optional service, so it must NOT go in the top-level `inject`
-  // array — that would make the plugin fail to load wherever no provider is
-  // mounted. Going through `ctx.inject` keeps the composition entry (`config`)
-  // authoritative until a provider appears, and falls back to it on detach —
-  // exactly the old `installSettingsSection` contract.
-  const entry: Config = config ?? {}
-  ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, TIMER_AGENT_SETTINGS_NAMESPACE, Config, entry, {
-      setSource: (source) => { current = source },
-      onChange: sync,
-    })
+  host.settings.installSection(ctx, TIMER_AGENT_SETTINGS_NAMESPACE, Config, config ?? {}, {
+    setSource: (source) => { current = source },
+    onChange: sync,
   })
 
   sync()

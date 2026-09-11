@@ -13,10 +13,15 @@
  * Each group carries its own "new session" leaf (workdir set, sessionId
  * blank); each session leaf pins that conversation (sessionId set).
  */
-// The client-side context is the ambient cordis `Context`; `dsh-client-runtime`
-// (and its `/client` subpath) was removed in 0.1.2 and folded into
-// `dsh-client-modules`, whose plugin face types the same value as cordis `Context`.
-import type { Context } from '@deepseek-ai/cordis'
+/**
+ * Minimal client-context face. Structural on purpose: dsh 0.1.2 no longer
+ * publishes `@deepseek-ai/dsh-client-runtime`, and every read below is a
+ * defensive cast anyway — the real shape is the ambient cordis augmentation
+ * at runtime.
+ */
+interface ClientContext {
+  readonly [key: string]: unknown
+}
 
 /** One pinned-session leaf. */
 export interface TargetSession {
@@ -69,7 +74,7 @@ async function hostWorkspaces(): Promise<WorkspaceRow[]> {
 }
 
 /** Project the client sessions store into flat rows (blank/subagent rows dropped). */
-function sessionRows(ctx: Context): SessionRow[] {
+function sessionRows(ctx: ClientContext): SessionRow[] {
   try {
     // Structural read: the ambient cordis Context augmentation merges several
     // `sessions` seats (the client runtime's ISessions face is the runtime
@@ -79,7 +84,9 @@ function sessionRows(ctx: Context): SessionRow[] {
         list?: { getSnapshot?(): unknown }
       }
     }).sessions
-    const snapshot = sessions?.list?.getSnapshot?.() as {
+    // Fallback when sessions service is missing
+    if (!sessions?.list?.getSnapshot) return []
+    const snapshot = sessions.list.getSnapshot() as {
       byId?: Record<string, {
         id?: string
         displayTitle?: string
@@ -104,7 +111,8 @@ function sessionRows(ctx: Context): SessionRow[] {
     }
     rows.sort((a, b) => b.updatedAt - a.updatedAt)
     return rows
-  } catch {
+  } catch (error) {
+    console.warn('[dsh-timer-agent] sessionRows failed:', error)
     return []
   }
 }
@@ -122,7 +130,7 @@ export interface ModelOptionGroup {
 /** Host model-options payload: the deployment default plus the catalog. */
 export interface ModelOptions {
   /** Deployment agentDefaultModel selection, when the service answers. */
-  default?: { provider: string, model: string, reasoningEffort?: string }
+  default?: { provider: string, model: string }
   /** Successfully loaded provider groups. */
   groups: ModelOptionGroup[]
 }
@@ -139,6 +147,43 @@ export async function listModelOptions(): Promise<ModelOptions> {
     }
   } catch {
     return { groups: [] }
+  }
+}
+
+/** One agent-preset roster row (the new-session preset picker data source). */
+export interface PresetOption {
+  /** Stable preset id (the preset directory's name). */
+  id: string
+  /** Trust tier: shipped with the deployment vs authored locally. */
+  trust: 'system' | 'user'
+  /** Display name from the preset's metadata; absent falls back to the id. */
+  name?: string
+  /** One sentence on what the preset is for, when it published one. */
+  description?: string
+  /** Why this preset cannot compose a session; absent when it can. */
+  broken?: string
+}
+
+/** Host preset-options payload: the roster default plus the roster rows. */
+export interface PresetOptions {
+  /** Deployment default preset id, when the service answers. */
+  default?: string
+  /** Discovered presets, first-root-wins per id. */
+  presets: PresetOption[]
+}
+
+/** Fetch host preset options (empty roster when the route is unreachable). */
+export async function listPresetOptions(): Promise<PresetOptions> {
+  try {
+    const response = await fetch('/api/dsh-timer-agent/preset-options')
+    if (!response.ok) return { presets: [] }
+    const body = await response.json() as Partial<PresetOptions>
+    return {
+      ...body.default === undefined ? {} : { default: body.default },
+      presets: Array.isArray(body.presets) ? body.presets : [],
+    }
+  } catch {
+    return { presets: [] }
   }
 }
 
@@ -161,7 +206,7 @@ function normPath(path: string): string {
  * @param ctx - client root context (sessions face for pinning).
  * @returns ordered groups.
  */
-export async function listTargetOptions(ctx: Context): Promise<TargetGroup[]> {
+export async function listTargetOptions(ctx: ClientContext): Promise<TargetGroup[]> {
   const [workspaces, sessions] = await Promise.all([
     hostWorkspaces(),
     Promise.resolve(sessionRows(ctx)),
@@ -186,20 +231,11 @@ export async function listTargetOptions(ctx: Context): Promise<TargetGroup[]> {
     })),
   })
 
-  // No synthetic "默认工作空间" (workdir='') — it has no real directory and
-  // confuses timed jobs. Prefer registered workspaces; leftover cwd buckets last.
-  const groups: TargetGroup[] = []
-  const seen = new Set<string>()
-  const preferredPath = normPath('D:/DSH/im-workspace')
+  const groups: TargetGroup[] = [
+    toGroup('default', '默认工作空间', ''),
+  ]
 
-  // Put im-workspace first when present.
-  for (const workspace of workspaces) {
-    const key = normPath(workspace.path)
-    if (key === preferredPath) {
-      seen.add(key)
-      groups.push(toGroup(`ws:${workspace.id}`, pathBasename(workspace.path), workspace.path))
-    }
-  }
+  const seen = new Set<string>([''])
   for (const workspace of workspaces) {
     const key = normPath(workspace.path)
     if (seen.has(key)) continue
