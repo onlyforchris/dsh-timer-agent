@@ -61,6 +61,17 @@
 - **系统提示注入**:host 半边注册 `plugin:timer-agent` 播报段,agent 知晓本插件能力与协作方式
 - **安全**:API 路由仅回环 + 同源可访问(与 dsh-ssh 同防线)
 
+## v0.7.0 变更（兼容 dsh 0.1.5-rc.2）
+
+**适配 dsh 0.1.5-rc.2**（自 v0.6.0 的 dsh 0.1.2-rc.1 跨四个 minor 升级，宿主插件面 API 几乎全部稳定，仅两处破坏性变化）：
+
+- `agents` 的 `cancel(cause)`：宿主把自由文本 cause 换成了稳定意图枚举（`user`/`parent`/`hook`/`disposed`）。本插件的超时取消迁移为 `{ kind: 'hook', reason: … }`（无人到场的自动取消并携带原因）
+- 冷读服务拆分：`sessionPersistence.inspect` 被移除。钉住会话恢复时的预设重建改走 `sessionQuery.readSession`（完整事件流，`agent-preset/selected` 仍生效）；宿主未挂 `sessionQuery` 时回退 `sessionPersistence.stat` 读 header
+- 其余宿主面（五项服务注入名、webServer 路由、systemPrompt.section、tools.register、`session/event`/`turn/end`、agentDefaultModel/llm/agentPresets、followup 消息形状）经逐一核对全部不变；`dsh.compatibility.dshReleases` 声明更新为 `0.1.5-rc.2`
+- peer/dev 依赖对齐 dsh 0.1.5-rc.2 配对版本（cordis ^4.0.2）；插件继续使用 `schemastery`（宿主运行时对 schema 仅做鸭子类型调用，分叉包无影响）
+
+**向下兼容**：任务台账格式无变化，v0.6.0 及更早的 `~/.dsh/timer-agent/jobs.json` 升级即用；仅在 dsh ≥ 0.1.5 上验证，旧版 dsh 请用 v0.6.0。
+
 ## v0.5.0 变更与向下兼容
 
 **变更**
@@ -138,7 +149,7 @@ E2E 覆盖:cron 解析与下次运行计算(本地时间语义)、台账原子�
 
 **兼容范围**（声明于 package.json）：
 
-- DSH：`0.1.1-rc.2`（`dsh.compatibility.dshReleases` 精确声明 `compatible`；其他版本未验证，视为 `unknown`）
+- DSH：`0.1.5-rc.2`（`dsh.compatibility.dshReleases` 精确声明 `compatible`；其他版本未验证，视为 `unknown`）
 - Node.js：`>=22`（`engines.node`；仓库内测试依赖 Node 22+ 的 type-stripping 能力）
 - 系统：开发验证环境为 Windows 10/11；macOS/Linux 未验证
 
@@ -157,7 +168,7 @@ E2E 覆盖:cron 解析与下次运行计算(本地时间语义)、台账原子�
 
 **失败边界**：服务进程停止即不触发（错过即跳过）；台账损坏时降级为空表并备份原文件；运行中到点跳过本次；手动触发与 ticker 触发经同一 at-most-once 通道，不会重复执行。
 
-**源码版本锚**：v0.5.0 发布于 commit `88ce4c30f54a257143dd80262cf7044aff431372`。
+**源码版本锚**：v0.7.0 发布于 tag `v0.7.0`。
 
 ## 已知限制
 

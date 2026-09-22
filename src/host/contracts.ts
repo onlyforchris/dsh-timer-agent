@@ -4,7 +4,7 @@
  * package build self-contained while a composed DSH profile supplies the
  * real implementations at runtime. Field shapes mirror `@deepseek-ai/dsh-agent`,
  * `@deepseek-ai/dsh-tools`, and the webserver's route surface as of
- * dsh 0.1.0-rc.6.
+ * dsh 0.1.5-rc.2.
  * @module dsh-timer-agent/host-contracts
  */
 
@@ -47,6 +47,18 @@ export interface HostUserMessage {
   }
 }
 
+/**
+ * Why an active agent is cancelled. dsh 0.1.5 replaced the free-text cause
+ * string with this stable intent enum (`AgentCancelCause`); the runner's
+ * timeout path speaks `{ kind: 'hook', reason }` (an automated component
+ * cancelling with a reason, no user present).
+ */
+export type HostAgentCancelCause =
+  | { readonly kind: 'user' }
+  | { readonly kind: 'parent' }
+  | { readonly kind: 'hook', readonly reason: string }
+  | { readonly kind: 'disposed' }
+
 /** Public live-agent handle (subset of the host `Agent` interface). */
 export interface HostAgent {
   readonly id: string
@@ -54,7 +66,7 @@ export interface HostAgent {
   /** Queue an ordinary follow-up turn and wake the driver. */
   followup(message: HostUserMessage): void
   /** Clear queued work and abort the active turn. */
-  cancel(cause: string): void
+  cancel(cause: HostAgentCancelCause): void
 }
 
 /** An owned agent plus its teardown capability, from `agents.create()`. */
@@ -129,15 +141,28 @@ export interface HostAgentPresetRow {
 }
 
 /**
- * The `sessionPersistence` service (subset): cold session inspection used to
- * rebuild a resumed session's recorded preset selection.
+ * The `sessionQuery` service (subset of the host `SessionQueryEngine`, new in
+ * the cold-read role dsh 0.1.5 carved out of `sessionPersistence`): the full
+ * raw event log plus header of one session, cold.
  */
-export interface HostSessionPersistence {
-  /** Read one session's header and event log without resuming it. */
-  inspect(sessionId: string): Promise<{
-    readonly meta: { readonly agentPreset?: string }
+export interface HostSessionQuery {
+  /** Read one session's header and complete raw event log. */
+  readSession(sessionId: string): Promise<{
+    readonly session: { readonly agentPreset?: string }
     readonly events: ReadonlyArray<{ readonly type: string, readonly data?: { readonly agentPreset?: string } }>
   }>
+}
+
+/**
+ * The `sessionPersistence` service (subset): dsh 0.1.5 removed `inspect` —
+ * header reads now go through `stat`, event-level cold reads through
+ * `sessionQuery` (see {@link HostSessionQuery}).
+ */
+export interface HostSessionPersistence {
+  /** Read one session's stored header without opening it (undefined = unknown). */
+  stat(sessionId: string): Promise<{
+    readonly header: { readonly agentPreset?: string }
+  } | undefined>
 }
 
 /**
@@ -257,8 +282,9 @@ export interface HostSettingsSectionHooks<T> {
 /**
  * The `settings` service (subset of the host `SettingsProvider`): namespace
  * registration for optional-settings consumers. Mirrors
- * `SettingsProvider.installSection` as of dsh 0.1.2-rc.1 — the pre-0.1.2
- * `installSettingsSection` helper export no longer exists.
+ * `SettingsProvider.installSection` as of dsh 0.1.5-rc.2 — the same five-param
+ * shape dsh 0.1.2 introduced (`installSettingsSection` helper long gone;
+ * the hooks' `validate?` member stays optional and unused here).
  */
 export interface HostSettings {
   /**
@@ -330,6 +356,8 @@ export interface HostPluginContext {
   get(service: 'agentPresets'): HostAgentPresets | undefined
   /** The session persistence service, when mounted ('sessionPersistence'). */
   get(service: 'sessionPersistence'): HostSessionPersistence | undefined
+  /** The cold session-read service, when mounted ('sessionQuery', dsh 0.1.5+). */
+  get(service: 'sessionQuery'): HostSessionQuery | undefined
   get(service: string): unknown
   on(event: 'session/event', listener: (session: HostSession, event: HostSessionEvent) => void): () => void
   effect(setup: () => () => void, label?: string): void
