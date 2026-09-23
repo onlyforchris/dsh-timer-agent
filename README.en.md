@@ -63,6 +63,17 @@ Run settlement rides `session/event` (`turn/end`'s `reason.kind`); failure reaso
 - **System-prompt injection**: the host half registers a `plugin:timer-agent` announcement section so agents know the capability
 - **Safety**: API routes are loopback + same-origin only (same fence as dsh-ssh)
 
+## v0.7.0 changes (dsh 0.1.5-rc.2 compatibility)
+
+Adapts to **dsh 0.1.5-rc.2** (up from v0.6.0's dsh 0.1.2-rc.1; the host plugin surface stayed stable across the four minors, with exactly two breaking changes):
+
+- `agents.cancel(cause)`: the host replaced the free-text cause with a stable intent enum (`user`/`parent`/`hook`/`disposed`). The plugin's timeout cancellation now speaks `{ kind: 'hook', reason: … }` (automated cancel with a reason, no user present)
+- Cold-read split: `sessionPersistence.inspect` was removed. The pinned-session preset rebuild now reads through `sessionQuery.readSession` (full raw event log; `agent-preset/selected` still wins) and falls back to `sessionPersistence.stat` for the header
+- Everything else was verified unchanged (the five service inject names, webServer routes, systemPrompt.section, tools.register, `session/event`/`turn/end`, agentDefaultModel/llm/agentPresets, the followup message shape); the `dsh.compatibility.dshReleases` declaration now reads `0.1.5-rc.2`
+- peer/dev dependencies aligned to the dsh 0.1.5-rc.2 pairing (cordis ^4.0.2); the plugin keeps plain `schemastery` (the host calls schemas duck-typed, the fork changes nothing)
+
+**Backward compatibility**: the job ledger format is unchanged — a v0.6.0-or-older `~/.dsh/timer-agent/jobs.json` works as-is. Verified on dsh ≥ 0.1.5 only; for older dsh use v0.6.0.
+
 ## v0.5.0 changes & backward compatibility
 
 **Changes**
@@ -116,7 +127,7 @@ The E2E suite covers: cron parsing and next-run computation (local-time semantic
 
 **Compatibility** (declared in package.json):
 
-- DSH: `0.1.1-rc.2` (exact `compatible` via `dsh.compatibility.dshReleases`; other releases unverified = `unknown`)
+- DSH: `0.1.5-rc.2` (exact `compatible` via `dsh.compatibility.dshReleases`; other releases unverified = `unknown`)
 - Node.js: `>=22` (`engines.node`; the repo's tests rely on Node 22+ type-stripping)
 - OS: verified on Windows 10/11; macOS/Linux unverified
 
@@ -135,7 +146,7 @@ The E2E suite covers: cron parsing and next-run computation (local-time semantic
 
 **Failure bounds**: a stopped service process fires nothing (missed means missed); a corrupted ledger degrades to an empty table with the original file backed up; a mid-run due slot skips; manual and ticker triggers share one at-most-once channel and never double-execute.
 
-**Source anchor**: v0.5.0 released at commit `88ce4c30f54a257143dd80262cf7044aff431372`.
+**Source anchor**: v0.7.0 released at tag `v0.7.0`.
 
 ## Known limits
 

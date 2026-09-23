@@ -1,7 +1,7 @@
 {
   "name": "@onlyforchris/dsh-timer-agent",
   "description": "Timer x Agent plugin for the dsh web GUI (inspired by hermes-agent cron): a sidebar entry plus a scheduled-jobs board with per-job project/workspace + session targeting (or new session in the default workspace when both are blank), cron schedules, and real execution through dsh sessions (session.prompt). Hot-pluggable —mounted via the web profile bundles, no dsh source changes.",
-  "version": "0.6.0-3",
+  "version": "0.7.0-1",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -21,20 +21,16 @@
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/onlyforchris/dsh-timer-agent.git"
-  },
+  "repository": "https://github.com/onlyforchris/dsh-timer-agent",
   "engines": {
     "node": ">=22"
   },
   "dsh": {
     "compatibility": {
       "dshReleases": {
-        "0.1.2-rc.1": "compatible",
         "0.1.5-rc.2": "compatible",
-        "0.1.6-alpha.1": "compatible",
-        "0.1.6-alpha.2": "compatible"
+        "0.1.6-alpha.2": "compatible",
+        "0.1.7-alpha.2": "compatible"
       }
     },
     "bundle": {
@@ -49,23 +45,23 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-connection": "0.1.5-rc.2 || 0.1.6-alpha.1 || 0.1.6-alpha.2",
-    "@deepseek-ai/dsh-client-ui-settings": "0.1.5-rc.2 || 0.1.6-alpha.1 || 0.1.6-alpha.2",
-    "@deepseek-ai/dsh-system-prompt": "0.1.5-rc.2 || 0.1.6-alpha.1 || 0.1.6-alpha.2",
-    "@deepseek-ai/dsh-tools": "0.1.5-rc.2 || 0.1.6-alpha.1 || 0.1.6-alpha.2",
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-client-connection": "0.1.5-rc.2 || 0.1.6-alpha.2 || 0.1.7-alpha.2",
+    "@deepseek-ai/dsh-client-ui-settings": "0.1.5-rc.2 || 0.1.6-alpha.2 || 0.1.7-alpha.2",
+    "@deepseek-ai/dsh-system-prompt": "0.1.5-rc.2 || 0.1.6-alpha.2 || 0.1.7-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.1.5-rc.2 || 0.1.6-alpha.2 || 0.1.7-alpha.2",
     "react": "^18.2.0"
   },
   "dependencies": {
     "schemastery": "^3.18.0"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-client-connection": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-client-locale": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-client-ui-settings": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-system-prompt": "0.1.6-alpha.2",
-    "@deepseek-ai/dsh-tools": "0.1.6-alpha.2",
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-client-connection": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-client-locale": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-client-ui-settings": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-system-prompt": "0.1.7-alpha.2",
+    "@deepseek-ai/dsh-tools": "0.1.7-alpha.2",
     "@tsdown/css": "0.22.2",
     "@types/node": "^22.20.1",
     "@types/react": "~18.3.1",
@@ -91,20 +87,5 @@
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-transform-types tests/e2e.mts && node --experimental-transform-types tests/ui.mts && node --experimental-transform-types tests/client-apply.mts && node --experimental-transform-types tests/schedule.mts",
     "smoke-test": "pnpm run build && node scripts/smoke-test.mjs"
-  },
-  "author": {
-    "name": "onlyforchris",
-    "url": "https://github.com/onlyforchris"
-  },
-  "homepage": "https://github.com/onlyforchris/dsh-timer-agent#readme",
-  "bugs": "https://github.com/onlyforchris/dsh-timer-agent/issues",
-  "publishConfig": {
-    "access": "public"
-  },
-  "contributors": [
-    {
-      "name": "LouisHaoL",
-      "url": "https://github.com/LouisHaoL"
-    }
-  ]
+  }
 }

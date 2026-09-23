@@ -41,7 +41,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   announceToAgent: z.boolean().default(true),
   enabled: z.boolean().default(true),
-})
+}) as unknown as z<Config>
 
 /** Schema default, re-read for hand-built test contexts. */
 const DEFAULT_ANNOUNCE = true
@@ -100,7 +100,9 @@ export function apply(ctx: Context, config?: Config): void {
     }
   }
 
-  host.settings.installSection(ctx, TIMER_AGENT_SETTINGS_NAMESPACE, Config, config ?? {}, {
+  // DSH 0.1.7 exposes plugin Config through its native settings forms.
+  // Earlier releases need the explicit namespace registration.
+  host.settings.installSection?.(ctx, TIMER_AGENT_SETTINGS_NAMESPACE, Config, config ?? {}, {
     setSource: (source) => { current = source },
     onChange: sync,
   })

@@ -156,7 +156,9 @@ export class TimerRunner {
       if (flight.timeoutAt === undefined || this.now() < flight.timeoutAt) continue
       this.inFlight.delete(flight.messageId)
       try {
-        flight.agent?.cancel('dsh-timer-agent: run timed out')
+        // dsh 0.1.5 cancel cause is an intent enum, not free text: a scheduled
+        // run's timeout is an automated component cancelling with a reason.
+        flight.agent?.cancel({ kind: 'hook', reason: 'dsh-timer-agent: run timed out' })
       } catch (error) {
         console.warn('[dsh-timer-agent] timeout cancel failed:', error)
       }
@@ -536,27 +538,32 @@ export class TimerRunner {
   /**
    * Compose a RESUMED session's recorded preset: the last
    * `agent-preset/selected` event wins over the creation header
-   * (`resolveSessionPreset` semantics), read through cold persistence
-   * inspection; a session that recorded none falls back to the roster
-   * default. Rejection means "compose nothing" — the caller resumes bare
-   * rather than abandoning the pinned conversation.
+   * (`resolveSessionPreset` semantics), read through the cold-read services —
+   * dsh 0.1.5 split them: `sessionQuery.readSession` carries the raw event
+   * log, `sessionPersistence.stat` the header. A session that recorded none
+   * falls back to the roster default. Rejection means "compose nothing" — the
+   * caller resumes bare rather than abandoning the pinned conversation.
    */
   private async presetSetupFor(sessionId: string): Promise<((agentCtx: object) => Promise<void>) | undefined> {
     const presets = this.ctx.get('agentPresets')
     if (presets === undefined) return undefined
     let recorded: string | undefined
     try {
-      const persistence = this.ctx.get('sessionPersistence')
-      const inspected = persistence === undefined ? undefined : await persistence.inspect(sessionId)
-      if (inspected !== undefined) {
-        for (let index = inspected.events.length - 1; index >= 0; index -= 1) {
-          const event = inspected.events[index]
+      const query = this.ctx.get('sessionQuery')
+      if (query !== undefined) {
+        const snapshot = await query.readSession(sessionId)
+        for (let index = snapshot.events.length - 1; index >= 0; index -= 1) {
+          const event = snapshot.events[index]
           if (event?.type === 'agent-preset/selected' && typeof event.data?.agentPreset === 'string') {
             recorded = event.data.agentPreset
             break
           }
         }
-        recorded = recorded ?? inspected.meta.agentPreset
+        recorded = recorded ?? snapshot.session.agentPreset
+      } else {
+        const persistence = this.ctx.get('sessionPersistence')
+        const snapshot = persistence === undefined ? undefined : await persistence.stat(sessionId)
+        recorded = snapshot?.header.agentPreset
       }
     } catch {
       recorded = undefined
